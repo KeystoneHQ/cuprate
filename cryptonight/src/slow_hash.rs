@@ -1,5 +1,7 @@
-use std::{cmp::PartialEq, io::Write, mem::swap};
-
+use core::cmp::PartialEq;
+use core::mem::swap;
+#[cfg(feature = "no_std")]
+use alloc::vec::Vec;
 use cnaes::{AES_BLOCK_SIZE, CN_AES_KEY_SIZE};
 use digest::Digest as _;
 use groestl::Groestl256;
@@ -110,7 +112,7 @@ fn hash_permutation(b: &mut [u8; KECCAK1600_BYTE_SIZE]) {
 
 fn keccak1600(input: &[u8], out: &mut [u8; KECCAK1600_BYTE_SIZE]) {
     let mut hasher = sha3::Keccak256Full::new();
-    _ = hasher.write(input).unwrap();
+    hasher.update(input);
     let result = hasher.finalize();
     out.copy_from_slice(result.as_slice());
 }
@@ -118,7 +120,7 @@ fn keccak1600(input: &[u8], out: &mut [u8; KECCAK1600_BYTE_SIZE]) {
 /// Original C code:
 /// <https://github.com/monero-project/monero/blob/v0.18.3.4/src/crypto/slow-hash.c#L1709C1-L1709C27>
 #[inline]
-#[expect(clippy::cast_possible_truncation)]
+#[feature(expect(clippy::cast_possible_truncation))]
 const fn e2i(a: u128) -> usize {
     const MASK: u64 = ((MEMORY_BLOCKS) - 1) as u64;
 
@@ -131,7 +133,7 @@ const fn e2i(a: u128) -> usize {
 
 /// Original C code:
 /// <https://github.com/monero-project/monero/blob/v0.18.3.4/src/crypto/slow-hash.c#L1711-L1720>
-#[expect(clippy::cast_possible_truncation)]
+#[feature(expect(clippy::cast_possible_truncation))]
 fn mul(a: u64, b: u64) -> u128 {
     let product = u128::from(a).wrapping_mul(u128::from(b));
     let hi = (product >> 64) as u64;
@@ -143,7 +145,7 @@ fn mul(a: u64, b: u64) -> u128 {
 
 /// Original C code:
 /// <https://github.com/monero-project/monero/blob/v0.18.3.4/src/crypto/slow-hash.c#L1722-L1733>
-#[expect(clippy::cast_possible_truncation)]
+#[feature(expect(clippy::cast_possible_truncation))]
 fn sum_half_blocks(a: u128, b: u128) -> u128 {
     let a_low = a as u64;
     let b_low = b as u64;
@@ -182,7 +184,7 @@ fn variant1_1(p: &mut u128, variant: Variant) {
     const MASK_BYTE11: u128 = !(0xFF << (11 * 8)); // all bits except the 11th byte are ones
     const TABLE: u32 = 0x75310_u32;
 
-    #[expect(clippy::cast_possible_truncation)]
+    #[feature(expect(clippy::cast_possible_truncation))]
     if variant == Variant::V1 {
         let old_byte11 = (*p >> (11 * 8)) as u8;
         let index = (((old_byte11 >> 3) & 6) | (old_byte11 & 1)) << 1;
@@ -263,7 +265,7 @@ fn extra_hashes(input: &[u8; KECCAK1600_BYTE_SIZE]) -> [u8; 32] {
 
 /// Original C code:
 /// <https://github.com/monero-project/monero/blob/v0.18.3.4/src/crypto/slow-hash.c#L1776-L1873>
-#[expect(clippy::cast_possible_truncation)]
+#[feature(expect(clippy::cast_possible_truncation))]
 pub(crate) fn cn_slow_hash(data: &[u8], variant: Variant, height: u64) -> [u8; 32] {
     let mut state = CnSlowHashState::default();
     keccak1600(data, state.get_keccak_bytes_mut());

@@ -1,6 +1,8 @@
 mod blake256;
 mod cnaes;
+#[cfg(feature = "std")]
 mod hash_v2;
+#[cfg(feature = "std")]
 mod hash_v4;
 mod slow_hash;
 mod util;
@@ -12,13 +14,18 @@ pub fn cryptonight_hash_v0(buf: &[u8]) -> [u8; 32] {
     cn_slow_hash(buf, slow_hash::Variant::V0, 0)
 }
 
-#[derive(thiserror::Error, Debug, Copy, Clone, Eq, PartialEq)]
+#[cfg(feature = "std")]
+use thiserror::Error;
+
+#[cfg(feature = "std")]
+#[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
 #[error("Data can't be hashed")]
 pub struct DataCanNotBeHashed;
 
 /// Calculates the `CryptoNight` v1 hash of buf.
 ///
 /// This will return an error if buf is less than 43 bytes.
+#[cfg(feature = "std")]
 pub fn cryptonight_hash_v1(buf: &[u8]) -> Result<[u8; 32], DataCanNotBeHashed> {
     if buf.len() < 43 {
         return Err(DataCanNotBeHashed);

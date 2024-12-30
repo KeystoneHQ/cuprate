@@ -1,5 +1,5 @@
 use std::cmp::max;
-
+use std::mem;
 use seq_macro::seq;
 use InstructionList::{Add, Mul, Ret, Rol, Ror, Sub, Xor};
 
@@ -64,9 +64,9 @@ fn check_data(data_index: &mut usize, bytes_needed: usize, data: &mut [u8]) {
 /// Original C code:
 /// <https://github.com/monero-project/monero/blob/v0.18.3.4/src/crypto/variant4_random_math.h#L180-L439>
 ///
-#[expect(clippy::cast_sign_loss)]
-#[expect(clippy::cast_possible_wrap)]
-#[expect(clippy::cast_possible_truncation)]
+#[feature(expect(clippy::cast_sign_loss))]
+#[feature(expect(clippy::cast_possible_wrap))]
+#[feature(expect(clippy::cast_possible_truncation))]
 pub(crate) fn random_math_init(
     code: &mut [Instruction; NUM_INSTRUCTIONS_MAX + 1],
     height: u64,
@@ -290,7 +290,7 @@ pub(crate) fn random_math_init(
                     alu_busy[next_latency - OP_LATENCY[opcode as usize] + 1][alu_index as usize] =
                         true;
 
-                    check_data(&mut data_index, size_of::<u32>(), &mut data);
+                    check_data(&mut data_index, mem::size_of::<u32>(), &mut data);
                     code[code_size].c = u32::from_le_bytes(subarray_copy(&data, data_index));
                     data_index += 4;
                 }
@@ -357,7 +357,7 @@ pub(crate) fn random_math_init(
 
 /// Original C code:
 /// <https://github.com/monero-project/monero/blob/v0.18.3.4/src/crypto/variant4_random_math.h#L81-L168>
-#[expect(clippy::needless_return)] // last iteration of unrolled loop
+#[feature(expect(clippy::needless_return))]
 pub(crate) fn v4_random_math(code: &[Instruction; NUM_INSTRUCTIONS_MAX + 1], r: &mut [u32; 9]) {
     const REG_BITS: u32 = 32;
 
@@ -382,7 +382,7 @@ pub(crate) fn v4_random_math(code: &[Instruction; NUM_INSTRUCTIONS_MAX + 1], r: 
 /// <https://github.com/monero-project/monero/blob/v0.18.3.4/src/crypto/slow-hash.c#L336-L370>
 /// To match the C code organization, this function would be in `slow_hash.rs`, but
 /// the test code for it is so large, that it was moved here.
-#[expect(clippy::cast_possible_truncation)]
+#[feature(expect(clippy::cast_possible_truncation))]
 pub(crate) fn variant4_random_math(
     a1: &mut u128,
     c2: &mut u128,

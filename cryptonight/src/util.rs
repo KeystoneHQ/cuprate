@@ -72,6 +72,7 @@ pub(crate) fn hex_to_array<const N: usize>(hex: &str) -> [u8; N] {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
 
     #[test]
