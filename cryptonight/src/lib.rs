@@ -3,7 +3,9 @@ extern crate alloc;
 
 mod blake256;
 mod cnaes;
+#[cfg(feature = "std")]
 mod hash_v2;
+#[cfg(feature = "std")]
 mod hash_v4;
 mod slow_hash;
 mod util;

@@ -10,9 +10,10 @@ use skein::{consts::U32, Skein512};
 
 use crate::{
     blake256::{Blake256, Digest as _},
-    cnaes, hash_v2 as v2, hash_v4 as v4,
-    util::{subarray, subarray_copy, subarray_mut},
+    cnaes, util::{subarray, subarray_copy, subarray_mut},
 };
+#[cfg(feature = "std")]
+use crate::{hash_v2 as v2, hash_v4 as v4};
 
 pub(crate) const MEMORY: usize = 1 << 21; // 2MB scratchpad
 pub(crate) const MEMORY_BLOCKS: usize = MEMORY / AES_BLOCK_SIZE;
@@ -232,6 +233,7 @@ fn variant_2_2(long_state: &mut [u128; MEMORY_BLOCKS], j: usize, d: &mut u128, v
 /// <https://github.com/monero-project/monero/blob/v0.18.3.4/src/crypto/slow-hash.c#L319-L334>
 /// The compiler would inline this code even without the `#[inline]` attribute, but we'd like
 /// to avoid coping `r` and `code` between stack addresses.
+#[cfg(feature = "std")]
 #[inline]
 fn variant4_math_init(
     height: u64,
@@ -275,6 +277,7 @@ pub(crate) fn cn_slow_hash(data: &[u8], variant: Variant, height: u64) -> [u8; 3
     let tweak1_2 = variant1_init(&state, data, variant);
     let mut b = [0_u128; 2];
     let (mut division_result, mut sqrt_result) = variant_2_init(&mut b, &state, variant);
+    #[cfg(feature = "std")]
     let (mut r, code) = variant4_math_init(height, &state, variant);
 
     // Use a vector so the memory is allocated on the heap. We might have 2MB
@@ -308,6 +311,7 @@ pub(crate) fn cn_slow_hash(data: &[u8], variant: Variant, height: u64) -> [u8; 3
         let mut j = e2i(a);
         c1 = long_state[j];
         cnaes::aesb_single_round(&mut c1, a);
+        #[cfg(feature = "std")]
         v2::variant2_shuffle_add(&mut c1, a, &b, long_state, j, variant);
 
         long_state[j] = c1 ^ b[0];
@@ -318,10 +322,13 @@ pub(crate) fn cn_slow_hash(data: &[u8], variant: Variant, height: u64) -> [u8; 3
         c2 = long_state[j];
 
         a1 = a;
+        #[cfg(feature = "std")]
         v2::variant2_integer_math(&mut c2, c1, &mut division_result, &mut sqrt_result, variant);
+        #[cfg(feature = "std")]
         v4::variant4_random_math(&mut a1, &mut c2, subarray_mut(&mut r, 0), &b, &code);
         let mut d = mul(c1 as u64, c2 as u64);
         variant_2_2(long_state, j, &mut d, variant);
+        #[cfg(feature = "std")]
         v2::variant2_shuffle_add(&mut c1, a, &b, long_state, j, variant);
         a1 = sum_half_blocks(a1, d);
         swap(&mut a1, &mut c2);
