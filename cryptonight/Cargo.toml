@@ -8,14 +8,25 @@ authors = ["dimalinux", "Boog900", "The Monero Project"]
 repository = "https://github.com/Cuprate/cuprate/tree/main/cryptonight"
 
 [dependencies]
-thiserror = { workspace = true }
-sha3 = "0.10.8"
-groestl = "0.10.1"
-skein = "0.1.0"
-jh = "0.1.0"
+sha3 = { version = "0.10.8", default-features = false, features = ["oid"] }
+groestl = { version = "0.10.1", default-features = false }
+skein = { version = "0.1.0", default-features = false }
+jh = { version = "0.1.0", default-features = false }
 keccak = "0.1.5"
 digest = "0.10.7"
-seq-macro = "0.3.5"
+
+[dependencies.seq-macro]
+version = "0.3.5"
+optional = true
+
+[dependencies.thiserror]
+workspace = true
+optional = true
+
+[features]
+default = ["std"]
+std = ["seq-macro", "thiserror"]
+no_std = []
 
 [dev-dependencies]
 hex = { workspace = true, features = ["std"] }

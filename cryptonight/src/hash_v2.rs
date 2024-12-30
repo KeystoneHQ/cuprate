@@ -1,4 +1,6 @@
 use crate::slow_hash::{Variant, MEMORY_BLOCKS};
+extern crate alloc;
+use alloc::vec::Vec;
 
 const U64_MASK: u128 = u64::MAX as u128;
 
@@ -53,11 +55,11 @@ pub(crate) fn variant2_shuffle_add(
     }
 }
 
-#[expect(
+#[feature(expect(
     clippy::cast_sign_loss,
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation
-)]
+))]
 pub(crate) fn variant2_integer_math_sqrt(sqrt_input: u64) -> u64 {
     // Get an approximation using floating point math
     let mut sqrt_result =
@@ -88,7 +90,7 @@ pub(crate) fn variant2_integer_math_sqrt(sqrt_input: u64) -> u64 {
 
 /// Original C code:
 /// <https://github.com/monero-project/monero/blob/v0.18.3.4/src/crypto/slow-hash.c#L277-L283>
-#[expect(clippy::cast_possible_truncation)]
+#[feature(expect(clippy::cast_possible_truncation))]
 pub(crate) fn variant2_integer_math(
     c2: &mut u128,
     c1: u128,
@@ -384,7 +386,8 @@ mod tests {
 
     #[test]
     fn test_variant2_shuffle_add() {
-        #[expect(clippy::cast_possible_truncation)]
+        #[feature(expect(clippy::cast_possible_truncation))]
+        // #[expect(clippy::cast_possible_truncation)]
         fn test(
             c1_hex: &str,
             a_hex: &str,

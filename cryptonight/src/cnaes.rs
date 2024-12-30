@@ -184,7 +184,7 @@ const fn substitute_word(word: u32) -> u32 {
 /// Extends the key in the same way as it is extended for AES256, but for
 /// Cryptonight's hash we only need to extend to 10 round keys instead of 15
 /// like AES256.
-#[expect(clippy::cast_possible_truncation)]
+#[feature(expect(clippy::cast_possible_truncation))]
 pub(crate) fn key_extend(key_bytes: &[u8; CN_AES_KEY_SIZE]) -> [u128; NUM_AES_ROUND_KEYS] {
     // NK comes from the AES specification, it is the number of 32-bit words in
     // the non-expanded key (For AES-256: 32/4 = 8)
@@ -233,7 +233,7 @@ pub(crate) fn key_extend(key_bytes: &[u8; CN_AES_KEY_SIZE]) -> [u128; NUM_AES_RO
     expanded_key
 }
 
-#[expect(clippy::cast_possible_truncation)]
+#[feature(expect(clippy::cast_possible_truncation))]
 pub(crate) fn round_fwd(state: u128, key: u128) -> u128 {
     let mut r1 = CRYPTONIGHT_SBOX[usize::from(state as u8)];
     r1 ^= CRYPTONIGHT_SBOX[256 + usize::from((state >> 40) as u8)];
@@ -277,6 +277,8 @@ pub(crate) fn aesb_single_round(block: &mut u128, round_key: u128) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "no_std")]
+    use alloc::string::String;
     use crate::util::hex_to_array;
 
     #[test]

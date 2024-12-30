@@ -118,7 +118,7 @@ impl Digest for Blake256 {
         }
     }
 
-    #[expect(clippy::cast_possible_truncation)]
+    #[feature(expect(clippy::cast_possible_truncation))]
     fn finalize(mut self) -> [u8; 32] {
         const PA: &[u8; 1] = &[0x81];
         const PB: &[u8; 1] = &[0x01];
@@ -224,7 +224,7 @@ impl Blake256 {
             g(i, 1, 6, 11, 12, 10);
         }
 
-        #[expect(clippy::needless_range_loop)]
+        #[feature(expect(clippy::needless_range_loop))]
         for i in 0..16 {
             self.h[i % 8] ^= v[i];
         }

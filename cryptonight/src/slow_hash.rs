@@ -1,5 +1,7 @@
-use std::{cmp::PartialEq, io::Write, mem::swap};
-
+use core::cmp::PartialEq;
+use core::mem::swap;
+#[cfg(feature = "no_std")]
+use alloc::vec::Vec;
 use cnaes::{AES_BLOCK_SIZE, CN_AES_KEY_SIZE};
 use digest::Digest as _;
 use groestl::Groestl256;
@@ -8,9 +10,10 @@ use skein::{consts::U32, Skein512};
 
 use crate::{
     blake256::{Blake256, Digest as _},
-    cnaes, hash_v2 as v2, hash_v4 as v4,
-    util::{subarray, subarray_copy, subarray_mut},
+    cnaes, util::{subarray, subarray_copy, subarray_mut},
 };
+#[cfg(feature = "std")]
+use crate::{hash_v2 as v2, hash_v4 as v4};
 
 pub(crate) const MEMORY: usize = 1 << 21; // 2MB scratchpad
 pub(crate) const MEMORY_BLOCKS: usize = MEMORY / AES_BLOCK_SIZE;
@@ -110,7 +113,7 @@ fn hash_permutation(b: &mut [u8; KECCAK1600_BYTE_SIZE]) {
 
 fn keccak1600(input: &[u8], out: &mut [u8; KECCAK1600_BYTE_SIZE]) {
     let mut hasher = sha3::Keccak256Full::new();
-    _ = hasher.write(input).unwrap();
+    hasher.update(input);
     let result = hasher.finalize();
     out.copy_from_slice(result.as_slice());
 }
@@ -118,7 +121,7 @@ fn keccak1600(input: &[u8], out: &mut [u8; KECCAK1600_BYTE_SIZE]) {
 /// Original C code:
 /// <https://github.com/monero-project/monero/blob/v0.18.3.4/src/crypto/slow-hash.c#L1709C1-L1709C27>
 #[inline]
-#[expect(clippy::cast_possible_truncation)]
+#[feature(expect(clippy::cast_possible_truncation))]
 const fn e2i(a: u128) -> usize {
     const MASK: u64 = ((MEMORY_BLOCKS) - 1) as u64;
 
@@ -131,7 +134,7 @@ const fn e2i(a: u128) -> usize {
 
 /// Original C code:
 /// <https://github.com/monero-project/monero/blob/v0.18.3.4/src/crypto/slow-hash.c#L1711-L1720>
-#[expect(clippy::cast_possible_truncation)]
+#[feature(expect(clippy::cast_possible_truncation))]
 fn mul(a: u64, b: u64) -> u128 {
     let product = u128::from(a).wrapping_mul(u128::from(b));
     let hi = (product >> 64) as u64;
@@ -143,7 +146,7 @@ fn mul(a: u64, b: u64) -> u128 {
 
 /// Original C code:
 /// <https://github.com/monero-project/monero/blob/v0.18.3.4/src/crypto/slow-hash.c#L1722-L1733>
-#[expect(clippy::cast_possible_truncation)]
+#[feature(expect(clippy::cast_possible_truncation))]
 fn sum_half_blocks(a: u128, b: u128) -> u128 {
     let a_low = a as u64;
     let b_low = b as u64;
@@ -182,7 +185,7 @@ fn variant1_1(p: &mut u128, variant: Variant) {
     const MASK_BYTE11: u128 = !(0xFF << (11 * 8)); // all bits except the 11th byte are ones
     const TABLE: u32 = 0x75310_u32;
 
-    #[expect(clippy::cast_possible_truncation)]
+    #[feature(expect(clippy::cast_possible_truncation))]
     if variant == Variant::V1 {
         let old_byte11 = (*p >> (11 * 8)) as u8;
         let index = (((old_byte11 >> 3) & 6) | (old_byte11 & 1)) << 1;
@@ -230,6 +233,7 @@ fn variant_2_2(long_state: &mut [u128; MEMORY_BLOCKS], j: usize, d: &mut u128, v
 /// <https://github.com/monero-project/monero/blob/v0.18.3.4/src/crypto/slow-hash.c#L319-L334>
 /// The compiler would inline this code even without the `#[inline]` attribute, but we'd like
 /// to avoid coping `r` and `code` between stack addresses.
+#[cfg(feature = "std")]
 #[inline]
 fn variant4_math_init(
     height: u64,
@@ -263,7 +267,7 @@ fn extra_hashes(input: &[u8; KECCAK1600_BYTE_SIZE]) -> [u8; 32] {
 
 /// Original C code:
 /// <https://github.com/monero-project/monero/blob/v0.18.3.4/src/crypto/slow-hash.c#L1776-L1873>
-#[expect(clippy::cast_possible_truncation)]
+#[feature(expect(clippy::cast_possible_truncation))]
 pub(crate) fn cn_slow_hash(data: &[u8], variant: Variant, height: u64) -> [u8; 32] {
     let mut state = CnSlowHashState::default();
     keccak1600(data, state.get_keccak_bytes_mut());
@@ -273,6 +277,7 @@ pub(crate) fn cn_slow_hash(data: &[u8], variant: Variant, height: u64) -> [u8; 3
     let tweak1_2 = variant1_init(&state, data, variant);
     let mut b = [0_u128; 2];
     let (mut division_result, mut sqrt_result) = variant_2_init(&mut b, &state, variant);
+    #[cfg(feature = "std")]
     let (mut r, code) = variant4_math_init(height, &state, variant);
 
     // Use a vector so the memory is allocated on the heap. We might have 2MB
@@ -306,6 +311,7 @@ pub(crate) fn cn_slow_hash(data: &[u8], variant: Variant, height: u64) -> [u8; 3
         let mut j = e2i(a);
         c1 = long_state[j];
         cnaes::aesb_single_round(&mut c1, a);
+        #[cfg(feature = "std")]
         v2::variant2_shuffle_add(&mut c1, a, &b, long_state, j, variant);
 
         long_state[j] = c1 ^ b[0];
@@ -316,10 +322,13 @@ pub(crate) fn cn_slow_hash(data: &[u8], variant: Variant, height: u64) -> [u8; 3
         c2 = long_state[j];
 
         a1 = a;
+        #[cfg(feature = "std")]
         v2::variant2_integer_math(&mut c2, c1, &mut division_result, &mut sqrt_result, variant);
+        #[cfg(feature = "std")]
         v4::variant4_random_math(&mut a1, &mut c2, subarray_mut(&mut r, 0), &b, &code);
         let mut d = mul(c1 as u64, c2 as u64);
         variant_2_2(long_state, j, &mut d, variant);
+        #[cfg(feature = "std")]
         v2::variant2_shuffle_add(&mut c1, a, &b, long_state, j, variant);
         a1 = sum_half_blocks(a1, d);
         swap(&mut a1, &mut c2);
