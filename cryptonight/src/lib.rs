@@ -1,4 +1,7 @@
+#![cfg_attr(not(feature = "std"), no_std)]
+
 #[cfg(feature = "no_std")]
+#[macro_use]
 extern crate alloc;
 
 mod blake256;
