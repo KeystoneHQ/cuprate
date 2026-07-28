@@ -1,7 +1,7 @@
 //! RPC response status type.
 
 //---------------------------------------------------------------------------------------------------- Import
-use std::fmt::Display;
+use std::{borrow::Cow, fmt::Display};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -13,7 +13,7 @@ use cuprate_epee_encoding::{
 };
 
 use crate::constants::{
-    CORE_RPC_STATUS_BUSY, CORE_RPC_STATUS_NOT_MINING, CORE_RPC_STATUS_OK,
+    CORE_RPC_STATUS_BUSY, CORE_RPC_STATUS_FAILED, CORE_RPC_STATUS_NOT_MINING, CORE_RPC_STATUS_OK,
     CORE_RPC_STATUS_PAYMENT_REQUIRED,
 };
 
@@ -33,31 +33,45 @@ use crate::constants::{
 /// use cuprate_rpc_types::{
 ///     misc::Status,
 ///     CORE_RPC_STATUS_BUSY, CORE_RPC_STATUS_NOT_MINING, CORE_RPC_STATUS_OK,
-///     CORE_RPC_STATUS_PAYMENT_REQUIRED
+///     CORE_RPC_STATUS_PAYMENT_REQUIRED, CORE_RPC_STATUS_FAILED
 /// };
-/// use serde_json::to_string;
+/// use serde_json::{to_string, from_str};
 ///
 /// let other = Status::Other("OTHER".into());
 ///
 /// assert_eq!(to_string(&Status::Ok).unwrap(),              r#""OK""#);
+/// assert_eq!(to_string(&Status::Failed).unwrap(),          r#""Failed""#);
 /// assert_eq!(to_string(&Status::Busy).unwrap(),            r#""BUSY""#);
 /// assert_eq!(to_string(&Status::NotMining).unwrap(),       r#""NOT MINING""#);
 /// assert_eq!(to_string(&Status::PaymentRequired).unwrap(), r#""PAYMENT REQUIRED""#);
 /// assert_eq!(to_string(&other).unwrap(),                   r#""OTHER""#);
 ///
+/// assert_eq!(from_str::<Status>(r#""Ok""#).unwrap(),               Status::Ok);
+/// assert_eq!(from_str::<Status>(r#""OK""#).unwrap(),               Status::Ok);
+/// assert_eq!(from_str::<Status>(r#""Failed""#).unwrap(),           Status::Failed);
+/// assert_eq!(from_str::<Status>(r#""FAILED""#).unwrap(),           Status::Failed);
+/// assert_eq!(from_str::<Status>(r#""Busy""#).unwrap(),             Status::Busy);
+/// assert_eq!(from_str::<Status>(r#""BUSY""#).unwrap(),             Status::Busy);
+/// assert_eq!(from_str::<Status>(r#""NOT MINING""#).unwrap(),       Status::NotMining);
+/// assert_eq!(from_str::<Status>(r#""PAYMENT REQUIRED""#).unwrap(), Status::PaymentRequired);
+/// assert_eq!(from_str::<Status>(r#""OTHER""#).unwrap(),            other);
+///
 /// assert_eq!(Status::Ok.as_ref(),              CORE_RPC_STATUS_OK);
+/// assert_eq!(Status::Failed.as_ref(),          CORE_RPC_STATUS_FAILED);
 /// assert_eq!(Status::Busy.as_ref(),            CORE_RPC_STATUS_BUSY);
 /// assert_eq!(Status::NotMining.as_ref(),       CORE_RPC_STATUS_NOT_MINING);
 /// assert_eq!(Status::PaymentRequired.as_ref(), CORE_RPC_STATUS_PAYMENT_REQUIRED);
 /// assert_eq!(other.as_ref(),                   "OTHER");
 ///
 /// assert_eq!(format!("{}", Status::Ok),              CORE_RPC_STATUS_OK);
+/// assert_eq!(format!("{}", Status::Failed),          CORE_RPC_STATUS_FAILED);
 /// assert_eq!(format!("{}", Status::Busy),            CORE_RPC_STATUS_BUSY);
 /// assert_eq!(format!("{}", Status::NotMining),       CORE_RPC_STATUS_NOT_MINING);
 /// assert_eq!(format!("{}", Status::PaymentRequired), CORE_RPC_STATUS_PAYMENT_REQUIRED);
 /// assert_eq!(format!("{}", other),                   "OTHER");
 ///
 /// assert_eq!(format!("{:?}", Status::Ok),              "Ok");
+/// assert_eq!(format!("{:?}", Status::Failed),          "Failed");
 /// assert_eq!(format!("{:?}", Status::Busy),            "Busy");
 /// assert_eq!(format!("{:?}", Status::NotMining),       "NotMining");
 /// assert_eq!(format!("{:?}", Status::PaymentRequired), "PaymentRequired");
@@ -70,12 +84,16 @@ pub enum Status {
     // `#[serde(rename = "")]` only takes raw string literals?
     // We have to re-type the constants here...
     /// Successful RPC response, everything is OK; [`CORE_RPC_STATUS_OK`].
-    #[cfg_attr(feature = "serde", serde(rename = "OK"))]
+    #[cfg_attr(feature = "serde", serde(rename = "OK", alias = "Ok"))]
     #[default]
     Ok,
 
+    /// Generic request failure.
+    #[cfg_attr(feature = "serde", serde(alias = "FAILED"))]
+    Failed,
+
     /// The daemon is busy, try later; [`CORE_RPC_STATUS_BUSY`].
-    #[cfg_attr(feature = "serde", serde(rename = "BUSY"))]
+    #[cfg_attr(feature = "serde", serde(rename = "BUSY", alias = "Busy"))]
     Busy,
 
     /// The daemon is not mining; [`CORE_RPC_STATUS_NOT_MINING`].
@@ -91,7 +109,7 @@ pub enum Status {
     /// This exists to act as a catch-all for all of
     /// `monerod`'s other strings it puts in the `status` field.
     #[cfg_attr(feature = "serde", serde(rename = "OTHER"), serde(untagged))]
-    Other(String),
+    Other(Cow<'static, str>),
 }
 
 impl From<String> for Status {
@@ -101,7 +119,8 @@ impl From<String> for Status {
             CORE_RPC_STATUS_BUSY => Self::Busy,
             CORE_RPC_STATUS_NOT_MINING => Self::NotMining,
             CORE_RPC_STATUS_PAYMENT_REQUIRED => Self::PaymentRequired,
-            _ => Self::Other(s),
+            CORE_RPC_STATUS_FAILED => Self::Failed,
+            _ => Self::Other(Cow::Owned(s)),
         }
     }
 }
@@ -110,6 +129,7 @@ impl AsRef<str> for Status {
     fn as_ref(&self) -> &str {
         match self {
             Self::Ok => CORE_RPC_STATUS_OK,
+            Self::Failed => CORE_RPC_STATUS_FAILED,
             Self::Busy => CORE_RPC_STATUS_BUSY,
             Self::NotMining => CORE_RPC_STATUS_NOT_MINING,
             Self::PaymentRequired => CORE_RPC_STATUS_PAYMENT_REQUIRED,
@@ -145,7 +165,7 @@ impl EpeeValue for Status {
 
     fn epee_default_value() -> Option<Self> {
         // <https://github.com/Cuprate/cuprate/pull/147#discussion_r1654992559>
-        Some(Self::Other(String::new()))
+        Some(Self::Other(Cow::Borrowed("")))
     }
 
     fn write<B: BufMut>(self, w: &mut B) -> cuprate_epee_encoding::Result<()> {
@@ -167,7 +187,7 @@ mod test {
             Status::Busy,
             Status::NotMining,
             Status::PaymentRequired,
-            Status::Other(String::new()),
+            Status::Other(Cow::Borrowed("")),
         ] {
             let mut buf = vec![];
 

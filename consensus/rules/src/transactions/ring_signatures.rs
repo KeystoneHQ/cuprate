@@ -2,11 +2,11 @@
 //!
 //! Some checks have to be done at deserialization or with data we don't have so we can't do them here, those checks are:
 //! <https://monero-book.cuprate.org/consensus_rules/transactions/ring_signatures.html#signatures-must-be-canonical>
-//! this happens at deserialization in monero-serai.
+//! this happens at deserialization in monero-oxide.
 //! <https://monero-book.cuprate.org/consensus_rules/transactions/ring_signatures.html#amount-of-signatures-in-a-ring>
-//! and this happens during ring signature verification in monero-serai.
+//! and this happens during ring signature verification in monero-oxide.
 //!
-use monero_serai::{ring_signatures::RingSignature, transaction::Input};
+use monero_oxide::{ring_signatures::RingSignature, transaction::Input};
 
 #[cfg(feature = "rayon")]
 use rayon::prelude::*;
@@ -26,7 +26,7 @@ pub(crate) fn check_input_signatures(
     match rings {
         Rings::Legacy(rings) => {
             // <https://monero-book.cuprate.org/consensus_rules/transactions/ring_signatures.html#amount-of-ring-signatures>
-            // rings.len() != inputs.len() can't happen but check any way.
+            // rings.len() != inputs.len() can't happen but check anyway.
             if signatures.len() != inputs.len() || rings.len() != inputs.len() {
                 return Err(TransactionError::RingSignatureIncorrect);
             }

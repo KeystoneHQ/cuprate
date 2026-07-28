@@ -1,7 +1,9 @@
+use std::sync::LazyLock;
+
 use curve25519_dalek::{EdwardsPoint, Scalar};
 use hex_literal::hex;
-use monero_serai::{
-    generators::H,
+use monero_oxide::{
+    ed25519::{CompressedPoint, Point},
     ringct::{
         clsag::ClsagError,
         mlsag::{AggregateRingMatrixBuilder, MlsagError, RingMatrix},
@@ -21,6 +23,9 @@ const GRANDFATHERED_TRANSACTIONS: [[u8; 32]; 2] = [
     hex!("c5151944f0583097ba0c88cd0f43e7fabb3881278aa2f73b3b0a007c5d34e910"),
     hex!("6f2f117cde6fbcf8d4a6ef8974fcac744726574ac38cf25d3322c996b21edd4c"),
 ];
+
+static H: LazyLock<EdwardsPoint> =
+    LazyLock::new(|| CompressedPoint::H.decompress().unwrap().into());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RingCTError {
@@ -54,7 +59,13 @@ fn check_rct_type(ty: RctType, hf: HardFork, tx_hash: &[u8; 32]) -> Result<(), R
         T::MlsagBulletproofsCompactAmount if GRANDFATHERED_TRANSACTIONS.contains(tx_hash) => Ok(()),
         T::ClsagBulletproof if hf >= F::V13 && hf < F::V16 => Ok(()),
         T::ClsagBulletproofPlus if hf >= F::V15 => Ok(()),
-        _ => Err(RingCTError::TypeNotAllowed),
+
+        T::AggregateMlsagBorromean
+        | T::MlsagBorromean
+        | T::MlsagBulletproofs
+        | T::MlsagBulletproofsCompactAmount
+        | T::ClsagBulletproof
+        | T::ClsagBulletproofPlus => Err(RingCTError::TypeNotAllowed),
     }
 }
 
@@ -74,9 +85,22 @@ fn simple_type_balances(rct_sig: &RctProofs) -> Result<(), RingCTError> {
         }
     };
 
-    let sum_inputs = pseudo_outs.iter().sum::<EdwardsPoint>();
-    let sum_outputs =
-        rct_sig.base.commitments.iter().sum::<EdwardsPoint>() + Scalar::from(rct_sig.base.fee) * *H;
+    let sum_inputs = pseudo_outs
+        .iter()
+        .map(CompressedPoint::decompress)
+        .map(|p| p.map(Point::into))
+        .sum::<Option<EdwardsPoint>>()
+        .ok_or(RingCTError::SimpleAmountDoNotBalance)?;
+
+    let sum_outputs = rct_sig
+        .base
+        .commitments
+        .iter()
+        .map(CompressedPoint::decompress)
+        .map(|p| p.map(Point::into))
+        .sum::<Option<EdwardsPoint>>()
+        .ok_or(RingCTError::SimpleAmountDoNotBalance)?
+        + Scalar::from(rct_sig.base.fee) * *H;
 
     if sum_inputs == sum_outputs {
         Ok(())
@@ -178,7 +202,7 @@ pub(crate) fn check_input_signatures(
                 .collect::<Vec<_>>();
 
             let mut matrix =
-                AggregateRingMatrixBuilder::new(&proofs.base.commitments, proofs.base.fee);
+                AggregateRingMatrixBuilder::new(&proofs.base.commitments, proofs.base.fee)?;
 
             rings.iter().try_for_each(|ring| matrix.push_ring(ring))?;
 
@@ -210,7 +234,7 @@ pub(crate) fn check_input_signatures(
                     panic!("How did we build a ring with no decoys?");
                 };
 
-                Ok(clsags.verify(ring, key_image, pseudo_out, msg)?)
+                Ok(clsags.verify(ring.clone(), key_image, pseudo_out, msg)?)
             }),
     }
 }

@@ -14,9 +14,9 @@ use tower::{Service, ServiceExt};
 use tracing::{instrument, Instrument, Span};
 
 use cuprate_p2p_core::{
-    client::{Client, DoHandshakeRequest, HandshakeError, InternalPeerID},
+    client::{Client, DoHandshakeRequest, HandshakeError, InternalPeerID, PeerSyncCallback},
     services::{AddressBookRequest, AddressBookResponse},
-    AddressBook, ConnectionDirection, NetworkZone,
+    AddressBook, ConnectionDirection, NetworkZone, Transport,
 };
 use cuprate_wire::{
     admin::{PingResponse, PING_OK_RESPONSE_STATUS_TEXT},
@@ -34,39 +34,43 @@ use crate::{
 /// Starts the inbound server. This function will listen to all incoming connections
 /// and initiate handshake if needed, after verifying the address isn't banned.
 #[instrument(level = "warn", skip_all)]
-pub async fn inbound_server<N, HS, A>(
-    new_connection_tx: mpsc::Sender<Client<N>>,
+pub(super) async fn inbound_server<Z, T, HS, A>(
+    new_connection_tx: mpsc::Sender<Client<Z>>,
     mut handshaker: HS,
     mut address_book: A,
-    config: P2PConfig<N>,
+    config: P2PConfig<Z>,
+    transport_config: Option<T::ServerConfig>,
+    inbound_semaphore: Arc<Semaphore>,
+    peer_sync_callback: Option<PeerSyncCallback>,
 ) -> Result<(), tower::BoxError>
 where
-    N: NetworkZone,
-    HS: Service<DoHandshakeRequest<N>, Response = Client<N>, Error = HandshakeError>
+    Z: NetworkZone,
+    T: Transport<Z>,
+    HS: Service<DoHandshakeRequest<Z, T>, Response = Client<Z>, Error = HandshakeError>
         + Send
         + 'static,
     HS::Future: Send + 'static,
-    A: AddressBook<N>,
+    A: AddressBook<Z>,
 {
     // Copying the peer_id before borrowing for ping responses (Make us avoid a `clone()`).
     let our_peer_id = config.basic_node_data().peer_id;
 
     // Mandatory. Extract server config from P2PConfig
-    let Some(server_config) = config.server_config else {
+    let Some(server_config) = transport_config else {
         tracing::warn!("No inbound server config provided, not listening for inbound connections.");
         return Ok(());
     };
 
     tracing::info!("Starting inbound connection server");
 
-    let listener = N::incoming_connection_listener(server_config, config.p2p_port)
+    let listener = T::incoming_connection_listener(server_config)
         .await
         .inspect_err(|e| tracing::warn!("Failed to start inbound server: {e}"))?;
 
     let mut listener = pin!(listener);
 
-    // Create semaphore for limiting to maximum inbound connections.
-    let semaphore = Arc::new(Semaphore::new(config.max_inbound_connections));
+    // Use the provided semaphore for limiting to maximum inbound connections.
+    let semaphore = inbound_semaphore;
     // Create ping request handling JoinSet
     let mut ping_join_set = JoinSet::new();
 
@@ -111,12 +115,23 @@ where
             });
 
             let new_connection_tx = new_connection_tx.clone();
+            let peer_sync_callback = peer_sync_callback.clone();
 
             tokio::spawn(
                 async move {
                     let client = timeout(HANDSHAKE_TIMEOUT, fut).await;
-                    if let Ok(Ok(peer)) = client {
-                        drop(new_connection_tx.send(peer).await);
+
+                    match client {
+                        Ok(Ok(peer)) => {
+                            let csd = peer.info.core_sync_data.lock().unwrap().clone();
+                            if new_connection_tx.send(peer).await.is_ok() {
+                                if let Some(ref peer_sync_callback) = peer_sync_callback {
+                                    peer_sync_callback.call(&csd);
+                                }
+                            }
+                        }
+                        Err(_) => tracing::debug!("Timed out"),
+                        Ok(Err(e)) => tracing::debug!("error: {e:?}"),
                     }
                 }
                 .instrument(Span::current()),

@@ -1,16 +1,16 @@
-use std::cmp::Ordering;
-
-use monero_serai::{
+use curve25519_dalek::traits::IsIdentity;
+use monero_oxide::{
+    ed25519::Point,
     ringct::RctType,
     transaction::{Input, Output, Timelock, Transaction},
 };
 
-pub use cuprate_types::TxVersion;
-
 use crate::{
-    batch_verifier::BatchVerifier, blocks::penalty_free_zone, check_point_canonically_encoded,
-    is_decomposed_amount, HardFork,
+    batch_verifier::BatchVerifier, blocks::penalty_free_zone, is_decomposed_amount, HardFork,
 };
+
+// re-export.
+pub use cuprate_types::TxVersion;
 
 mod contextual_data;
 mod ring_ct;
@@ -26,9 +26,9 @@ const MAX_TX_BLOB_SIZE: usize = 1_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum TransactionError {
-    #[error("The transactions version is incorrect.")]
+    #[error("The transaction's version is incorrect.")]
     TransactionVersionInvalid,
-    #[error("The transactions is too big.")]
+    #[error("The transaction is too big.")]
     TooBig,
     //-------------------------------------------------------- OUTPUTS
     #[error("Output is not a valid point.")]
@@ -41,11 +41,11 @@ pub enum TransactionError {
     NonZeroOutputForV2,
     #[error("The transaction has an output which is not decomposed.")]
     AmountNotDecomposed,
-    #[error("The transactions outputs overflow.")]
+    #[error("The transaction's outputs overflow.")]
     OutputsOverflow,
-    #[error("The transactions outputs too much.")]
+    #[error("The transaction's outputs are too much.")]
     OutputsTooHigh,
-    #[error("The transactions has too many outputs.")]
+    #[error("The transaction has too many outputs.")]
     InvalidNumberOfOutputs,
     //-------------------------------------------------------- INPUTS
     #[error("One or more inputs don't have the expected number of decoys.")]
@@ -85,7 +85,7 @@ pub enum TransactionError {
 /// <https://monero-book.cuprate.org/consensus_rules/transactions/outputs.html#output-keys-canonical>
 fn check_output_keys(outputs: &[Output]) -> Result<(), TransactionError> {
     for out in outputs {
-        if !check_point_canonically_encoded(&out.key) {
+        if out.key.decompress().is_none() {
             return Err(TransactionError::OutputNotValidPoint);
         }
     }
@@ -326,8 +326,12 @@ pub fn check_decoy_info(decoy_info: &DecoyInfo, hf: HardFork) -> Result<(), Tran
 fn check_key_images(input: &Input) -> Result<(), TransactionError> {
     match input {
         Input::ToKey { key_image, .. } => {
-            // this happens in monero-serai but we may as well duplicate the check.
-            if !key_image.is_torsion_free() {
+            // this happens in monero-oxide but we may as well duplicate the check.
+            if !key_image.decompress().as_ref().is_some_and(|p| {
+                let p = Point::into(*p);
+
+                p.is_torsion_free() && !p.is_identity()
+            }) {
                 return Err(TransactionError::KeyImageIsNotInPrimeSubGroup);
             }
         }
@@ -350,7 +354,7 @@ const fn check_input_type(input: &Input) -> Result<(), TransactionError> {
 /// Checks that the input has decoys.
 ///
 /// ref: <https://monero-book.cuprate.org/consensus_rules/transactions/inputs.html#no-empty-decoys>
-fn check_input_has_decoys(input: &Input) -> Result<(), TransactionError> {
+const fn check_input_has_decoys(input: &Input) -> Result<(), TransactionError> {
     match input {
         Input::ToKey { key_offsets, .. } => {
             if key_offsets.is_empty() {
@@ -388,15 +392,14 @@ fn check_ring_members_unique(input: &Input, hf: HardFork) -> Result<(), Transact
 /// ref: <https://monero-book.cuprate.org/consensus_rules/transactions/inputs.html#sorted-inputs>
 fn check_inputs_sorted(inputs: &[Input], hf: HardFork) -> Result<(), TransactionError> {
     let get_ki = |inp: &Input| match inp {
-        Input::ToKey { key_image, .. } => Ok(key_image.compress().to_bytes()),
+        Input::ToKey { key_image, .. } => Ok(key_image.to_bytes()),
         Input::Gen(_) => Err(TransactionError::IncorrectInputType),
     };
 
     if hf >= HardFork::V7 {
         for inps in inputs.windows(2) {
-            match get_ki(&inps[0])?.cmp(&get_ki(&inps[1])?) {
-                Ordering::Greater => (),
-                _ => return Err(TransactionError::InputsAreNotOrdered),
+            if get_ki(&inps[0])? <= get_ki(&inps[1])? {
+                return Err(TransactionError::InputsAreNotOrdered);
             }
         }
     }
@@ -479,14 +482,6 @@ fn check_inputs_contextual(
     current_chain_height: usize,
     hf: HardFork,
 ) -> Result<(), TransactionError> {
-    // This rule is not contained in monero-core explicitly, but it is enforced by how Monero picks ring members.
-    // When picking ring members monerod will only look in the DB at past blocks so an output has to be younger
-    // than this transaction to be used in this tx.
-    if tx_ring_members_info.youngest_used_out_height >= current_chain_height {
-        tracing::debug!("Transaction invalid: One or more ring members too young.");
-        return Err(TransactionError::OneOrMoreRingMembersLocked);
-    }
-
     check_10_block_lock(
         tx_ring_members_info.youngest_used_out_height,
         current_chain_height,

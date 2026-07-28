@@ -4,11 +4,13 @@
 use std::sync::LazyLock;
 
 use curve25519_dalek::{
-    constants::ED25519_BASEPOINT_POINT, edwards::VartimeEdwardsPrecomputation,
-    traits::VartimePrecomputedMultiscalarMul, EdwardsPoint, Scalar,
+    constants::{ED25519_BASEPOINT_COMPRESSED, ED25519_BASEPOINT_POINT},
+    edwards::CompressedEdwardsY,
+    edwards::VartimeEdwardsPrecomputation,
+    traits::VartimePrecomputedMultiscalarMul,
+    Scalar,
 };
-use monero_serai::generators::H;
-
+use monero_oxide::ed25519::CompressedPoint;
 //---------------------------------------------------------------------------------------------------- Pre-computation
 
 /// This is the decomposed amount table containing the mandatory Pre-RCT amounts. It is used to pre-compute 
@@ -41,23 +43,31 @@ pub const ZERO_COMMITMENT_DECOMPOSED_AMOUNT: [u64; 172] = [
 ];
 
 /// Runtime initialized [`H`] generator.
-static H_PRECOMP: LazyLock<VartimeEdwardsPrecomputation> =
-    LazyLock::new(|| VartimeEdwardsPrecomputation::new([*H, ED25519_BASEPOINT_POINT]));
+static H_PRECOMP: LazyLock<VartimeEdwardsPrecomputation> = LazyLock::new(|| {
+    VartimeEdwardsPrecomputation::new([
+        CompressedPoint::H.decompress().unwrap().into(),
+        ED25519_BASEPOINT_POINT,
+    ])
+});
 
 /// Runtime initialized zero commitment lookup table
 ///
 /// # Invariant
 /// This function assumes that the [`ZERO_COMMITMENT_DECOMPOSED_AMOUNT`]
 /// table is sorted.
-pub static ZERO_COMMITMENT_LOOKUP_TABLE: LazyLock<[EdwardsPoint; 172]> = LazyLock::new(|| {
-    let mut lookup_table: [EdwardsPoint; 172] = [ED25519_BASEPOINT_POINT; 172];
+pub static ZERO_COMMITMENT_LOOKUP_TABLE: LazyLock<[CompressedEdwardsY; 172]> =
+    LazyLock::new(|| {
+        let mut lookup_table: [CompressedEdwardsY; 172] = [ED25519_BASEPOINT_COMPRESSED; 172];
 
-    for (i, amount) in ZERO_COMMITMENT_DECOMPOSED_AMOUNT.into_iter().enumerate() {
-        lookup_table[i] = ED25519_BASEPOINT_POINT + *H * Scalar::from(amount);
-    }
+        #[expect(non_snake_case)]
+        let H = CompressedPoint::H.decompress().unwrap().into();
 
-    lookup_table
-});
+        for (i, amount) in ZERO_COMMITMENT_DECOMPOSED_AMOUNT.into_iter().enumerate() {
+            lookup_table[i] = (ED25519_BASEPOINT_POINT + H * Scalar::from(amount)).compress();
+        }
+
+        lookup_table
+    });
 
 //---------------------------------------------------------------------------------------------------- Free functions
 
@@ -66,7 +76,7 @@ pub static ZERO_COMMITMENT_LOOKUP_TABLE: LazyLock<[EdwardsPoint; 172]> = LazyLoc
 /// It will first attempt to lookup into the table of known Pre-RCT value.
 /// Compute it otherwise.
 #[expect(clippy::cast_possible_truncation)]
-pub fn compute_zero_commitment(amount: u64) -> EdwardsPoint {
+pub fn compute_zero_commitment(amount: u64) -> CompressedPoint {
     // OPTIMIZATION: Unlike monerod which execute a linear search across its lookup
     // table (O(n)). Cuprate is making use of an arithmetic based constant time
     // version (O(1)). It has been benchmarked in both hit and miss scenarios against
@@ -78,7 +88,7 @@ pub fn compute_zero_commitment(amount: u64) -> EdwardsPoint {
     // the amount without its most significant digit.
     let Some(log) = amount.checked_ilog10() else {
         // amount = 0 so H component is 0.
-        return ED25519_BASEPOINT_POINT;
+        return CompressedPoint::from(ED25519_BASEPOINT_COMPRESSED.0);
     };
     let div = 10_u64.pow(log);
 
@@ -89,7 +99,12 @@ pub fn compute_zero_commitment(amount: u64) -> EdwardsPoint {
     // there aren't only trailing zeroes behind the most significant digit.
     // The amount is not part of the table and can calculated apart.
     if most_significant_digit * div != amount {
-        return H_PRECOMP.vartime_multiscalar_mul([Scalar::from(amount), Scalar::ONE]);
+        return CompressedPoint::from(
+            H_PRECOMP
+                .vartime_multiscalar_mul([Scalar::from(amount), Scalar::ONE])
+                .compress()
+                .0,
+        );
     }
 
     // Calculating the index back by progressing within the powers of 10.
@@ -98,13 +113,14 @@ pub fn compute_zero_commitment(amount: u64) -> EdwardsPoint {
     // The index of the cached amount
     let index = (most_significant_digit - 1 + row_start) as usize;
 
-    ZERO_COMMITMENT_LOOKUP_TABLE[index]
+    CompressedPoint::from(ZERO_COMMITMENT_LOOKUP_TABLE[index].0)
 }
 
 //---------------------------------------------------------------------------------------------------- Tests
 #[cfg(test)]
 mod test {
     use curve25519_dalek::{traits::VartimePrecomputedMultiscalarMul, Scalar};
+    use monero_oxide::ed25519::Point;
 
     use crate::crypto::{compute_zero_commitment, H_PRECOMP, ZERO_COMMITMENT_DECOMPOSED_AMOUNT};
 
@@ -116,7 +132,10 @@ mod test {
     fn compare_lookup_with_computation() {
         for amount in ZERO_COMMITMENT_DECOMPOSED_AMOUNT {
             let commitment = H_PRECOMP.vartime_multiscalar_mul([Scalar::from(amount), Scalar::ONE]);
-            assert!(commitment == compute_zero_commitment(amount));
+            assert_eq!(
+                Point::from(commitment),
+                compute_zero_commitment(amount).decompress().unwrap()
+            );
         }
     }
 }

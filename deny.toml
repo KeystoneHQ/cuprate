@@ -83,7 +83,8 @@ ignore = [
     #{ crate = "a-crate-that-is-yanked@0.1.1", reason = "you can specify why you are ignoring the yanked crate" },
 
     # TODO: check this is sorted before a beta release.
-    { id = "RUSTSEC-2024-0370", reason = "unmaintained crate, not necessarily vulnerable yet." }
+    { id = "RUSTSEC-2024-0436", reason = "`paste` unmaintained, not necessarily vulnerable yet." },
+    { id = "RUSTSEC-2023-0071", reason = "rsa is used in arti." }
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.
@@ -100,13 +101,16 @@ ignore = [
 # [possible values: any SPDX 3.11 short identifier (+ optional exception)].
 allow = [
     # Nothing required - free to use without permission.
+    "0BSD",    # https://spdx.org/licenses/0BSD.html
     "CC0-1.0", # https://creativecommons.org/publicdomain/zero/1.0/
+    "Unlicense",
 
     # Must include copyright notice.
     "BSD-2-Clause", # https://tldrlegal.com/license/bsd-2-clause-license-(freebsd)
     "BSD-3-Clause", # https://tldrlegal.com/license/bsd-3-clause-license-(revised)
     "ISC",          # https://tldrlegal.com/license/isc-license
     "MIT",          # https://tldrlegal.com/license/mit-license
+    "NCSA",         # https://opensource.org/license/uoi-ncsa-php
 
     # Must include copyright notice/attribution/changes/etc
     "Apache-2.0 WITH LLVM-exception", # https://spdx.org/licenses/LLVM-exception.html
@@ -136,8 +140,8 @@ confidence-threshold = 0.8
 # Allow 1 or more licenses on a per-crate basis, so that particular licenses
 # aren't accepted for every possible crate as with the normal allow list
 exceptions = [
-    # Cuprate (AGPL-3.0)
-    { allow = ["AGPL-3.0"], name = "cuprated", version = "*" }
+    # Cuprate (AGPL-3.0-only)
+    { allow = ["AGPL-3.0-only"], name = "cuprated", version = "*" }
 
     # Each entry is the crate and version constraint, and its specific allow
     # list

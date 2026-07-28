@@ -66,12 +66,12 @@ pub struct AddressBook<Z: BorshNetworkZone> {
     peer_save_task_handle: Option<JoinHandle<std::io::Result<()>>>,
     peer_save_interval: Interval,
 
-    cfg: AddressBookConfig,
+    cfg: AddressBookConfig<Z>,
 }
 
 impl<Z: BorshNetworkZone> AddressBook<Z> {
     pub fn new(
-        cfg: AddressBookConfig,
+        cfg: AddressBookConfig<Z>,
         white_peers: Vec<ZoneSpecificPeerListEntryBase<Z::Addr>>,
         gray_peers: Vec<ZoneSpecificPeerListEntryBase<Z::Addr>>,
         anchor_peers: Vec<Z::Addr>,
@@ -216,7 +216,7 @@ impl<Z: BorshNetworkZone> AddressBook<Z> {
         if self.white_list.contains_peer(&peer.adr) {
             tracing::trace!("Peer {} is already in white list skipping.", peer.adr);
             return;
-        };
+        }
         if !self.gray_list.contains_peer(&peer.adr) {
             tracing::trace!("Adding peer {} to gray list.", peer.adr);
             peer.last_seen = 0;
@@ -302,9 +302,6 @@ impl<Z: BorshNetworkZone> AddressBook<Z> {
             if peb.pruning_seed != peer.pruning_seed {
                 return Err(AddressBookError::PeersDataChanged("Pruning seed"));
             }
-            if Z::CHECK_NODE_ID && peb.id != peer.id {
-                return Err(AddressBookError::PeersDataChanged("peer ID"));
-            }
             // TODO: cuprate doesn't need last seen timestamps but should we have them anyway?
             peb.last_seen = 0;
             peb.rpc_port = peer.rpc_port;
@@ -349,6 +346,7 @@ impl<Z: BorshNetworkZone> AddressBook<Z> {
         if let Some(addr) = peer.addr {
             // The peer is reachable, update our white list and add it to the anchor connections.
             self.update_white_list_peer_entry(&peer)?;
+            self.gray_list.remove_peer(&addr);
             self.anchor_list.insert(addr);
             self.white_list
                 .reduce_list(&self.anchor_list, self.cfg.max_white_list_length);
@@ -397,7 +395,7 @@ impl<Z: BorshNetworkZone> Service<AddressBookRequest<Z>> for AddressBook<Z> {
                     },
                 )
                 .map(|()| AddressBookResponse::Ok),
-            AddressBookRequest::IncomingPeerList(peer_list) => {
+            AddressBookRequest::IncomingPeerList(_, peer_list) => {
                 self.handle_incoming_peer_list(peer_list);
                 Ok(AddressBookResponse::Ok)
             }
@@ -420,7 +418,11 @@ impl<Z: BorshNetworkZone> Service<AddressBookRequest<Z>> for AddressBook<Z> {
             AddressBookRequest::GetBan(addr) => Ok(AddressBookResponse::GetBan {
                 unban_instant: self.peer_unban_instant(&addr).map(Instant::into_std),
             }),
-            AddressBookRequest::PeerlistSize
+            AddressBookRequest::OwnAddress => {
+                Ok(AddressBookResponse::OwnAddress(self.cfg.our_own_address))
+            }
+            AddressBookRequest::Peerlist
+            | AddressBookRequest::PeerlistSize
             | AddressBookRequest::ConnectionCount
             | AddressBookRequest::SetBan(_)
             | AddressBookRequest::GetBans

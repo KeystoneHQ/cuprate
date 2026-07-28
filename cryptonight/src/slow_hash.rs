@@ -1,8 +1,8 @@
-use core::cmp::PartialEq;
-use core::mem::swap;
-#[cfg(feature = "no_std")]
+#[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 use cnaes::{AES_BLOCK_SIZE, CN_AES_KEY_SIZE};
+use core::cmp::PartialEq;
+use core::mem::swap;
 use digest::Digest as _;
 use groestl::Groestl256;
 use jh::Jh256;
@@ -10,7 +10,8 @@ use skein::{consts::U32, Skein512};
 
 use crate::{
     blake256::{Blake256, Digest as _},
-    cnaes, util::{subarray, subarray_copy, subarray_mut},
+    cnaes,
+    util::{subarray, subarray_copy, subarray_mut},
 };
 #[cfg(feature = "std")]
 use crate::{hash_v2 as v2, hash_v4 as v4};
@@ -52,10 +53,11 @@ impl CnSlowHashState {
         &self.b
     }
 
-    fn get_keccak_bytes_mut(&mut self) -> &mut [u8; KECCAK1600_BYTE_SIZE] {
+    const fn get_keccak_bytes_mut(&mut self) -> &mut [u8; KECCAK1600_BYTE_SIZE] {
         &mut self.b
     }
 
+    #[cfg(feature = "std")]
     fn get_keccak_word(&self, index: usize) -> u64 {
         u64::from_le_bytes(subarray_copy(&self.b, index * 8))
     }
@@ -115,13 +117,13 @@ fn keccak1600(input: &[u8], out: &mut [u8; KECCAK1600_BYTE_SIZE]) {
     let mut hasher = sha3::Keccak256Full::new();
     hasher.update(input);
     let result = hasher.finalize();
-    out.copy_from_slice(result.as_slice());
+    out.copy_from_slice(result.as_ref());
 }
 
 /// Original C code:
 /// <https://github.com/monero-project/monero/blob/v0.18.3.4/src/crypto/slow-hash.c#L1709C1-L1709C27>
 #[inline]
-#[feature(expect(clippy::cast_possible_truncation))]
+#[expect(clippy::cast_possible_truncation)]
 const fn e2i(a: u128) -> usize {
     const MASK: u64 = ((MEMORY_BLOCKS) - 1) as u64;
 
@@ -134,19 +136,19 @@ const fn e2i(a: u128) -> usize {
 
 /// Original C code:
 /// <https://github.com/monero-project/monero/blob/v0.18.3.4/src/crypto/slow-hash.c#L1711-L1720>
-#[feature(expect(clippy::cast_possible_truncation))]
+#[expect(clippy::cast_possible_truncation)]
 fn mul(a: u64, b: u64) -> u128 {
     let product = u128::from(a).wrapping_mul(u128::from(b));
     let hi = (product >> 64) as u64;
     let lo = product as u64;
 
     // swap hi and low, so this isn't just a multiply
-    u128::from(lo) << 64 | u128::from(hi)
+    (u128::from(lo) << 64) | u128::from(hi)
 }
 
 /// Original C code:
 /// <https://github.com/monero-project/monero/blob/v0.18.3.4/src/crypto/slow-hash.c#L1722-L1733>
-#[feature(expect(clippy::cast_possible_truncation))]
+#[expect(clippy::cast_possible_truncation)]
 fn sum_half_blocks(a: u128, b: u128) -> u128 {
     let a_low = a as u64;
     let b_low = b as u64;
@@ -156,7 +158,7 @@ fn sum_half_blocks(a: u128, b: u128) -> u128 {
     let b_high = (b >> 64) as u64;
     let sum_high = a_high.wrapping_add(b_high);
 
-    u128::from(sum_high) << 64 | u128::from(sum_low)
+    (u128::from(sum_high) << 64) | u128::from(sum_low)
 }
 
 /// Original C code:
@@ -185,7 +187,7 @@ fn variant1_1(p: &mut u128, variant: Variant) {
     const MASK_BYTE11: u128 = !(0xFF << (11 * 8)); // all bits except the 11th byte are ones
     const TABLE: u32 = 0x75310_u32;
 
-    #[feature(expect(clippy::cast_possible_truncation))]
+    #[expect(clippy::cast_possible_truncation)]
     if variant == Variant::V1 {
         let old_byte11 = (*p >> (11 * 8)) as u8;
         let index = (((old_byte11 >> 3) & 6) | (old_byte11 & 1)) << 1;
@@ -204,6 +206,7 @@ fn variant1_2(c2: &mut u128, tweak1_2: u64, variant: Variant) {
 
 /// Original C code:
 /// <https://github.com/monero-project/monero/blob/v0.18.3.4/src/crypto/slow-hash.c#L171-L181>
+#[cfg(feature = "std")]
 fn variant_2_init(b: &mut [u128; 2], state: &CnSlowHashState, variant: Variant) -> (u64, u64) {
     if variant != Variant::V2 && variant != Variant::R {
         return (0, 0);
@@ -267,8 +270,11 @@ fn extra_hashes(input: &[u8; KECCAK1600_BYTE_SIZE]) -> [u8; 32] {
 
 /// Original C code:
 /// <https://github.com/monero-project/monero/blob/v0.18.3.4/src/crypto/slow-hash.c#L1776-L1873>
-#[feature(expect(clippy::cast_possible_truncation))]
+#[expect(clippy::cast_possible_truncation)]
 pub(crate) fn cn_slow_hash(data: &[u8], variant: Variant, height: u64) -> [u8; 32] {
+    #[cfg(not(feature = "std"))]
+    let _ = height;
+
     let mut state = CnSlowHashState::default();
     keccak1600(data, state.get_keccak_bytes_mut());
     let aes_expanded_key = cnaes::key_extend(state.get_aes_key0());
@@ -276,6 +282,7 @@ pub(crate) fn cn_slow_hash(data: &[u8], variant: Variant, height: u64) -> [u8; 3
 
     let tweak1_2 = variant1_init(&state, data, variant);
     let mut b = [0_u128; 2];
+    #[cfg(feature = "std")]
     let (mut division_result, mut sqrt_result) = variant_2_init(&mut b, &state, variant);
     #[cfg(feature = "std")]
     let (mut r, code) = variant4_math_init(height, &state, variant);

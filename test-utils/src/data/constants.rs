@@ -30,7 +30,7 @@ macro_rules! const_block_blob {
         ///
         /// ```rust
         #[doc = "# use cuprate_test_utils::data::*;"]
-        #[doc = "use monero_serai::{block::Block, transaction::Input};"]
+        #[doc = "use monero_oxide::{block::Block, transaction::Input};"]
         #[doc = ""]
         #[doc = concat!("let block = Block::read(&mut ", stringify!($name), ").unwrap();")]
         #[doc = ""]
@@ -38,7 +38,7 @@ macro_rules! const_block_blob {
         #[doc = concat!("assert_eq!(block.header.hardfork_signal, ", $minor_version, ");")]
         #[doc = concat!("assert_eq!(block.header.timestamp, ", $timestamp, ");")]
         #[doc = concat!("assert_eq!(block.header.nonce, ", $nonce, ");")]
-        #[doc = concat!("assert!(matches!(block.miner_transaction.prefix().inputs[0], Input::Gen(", $height, ")));")]
+        #[doc = concat!("assert!(matches!(block.miner_transaction().prefix().inputs[0], Input::Gen(", $height, ")));")]
         #[doc = concat!("assert_eq!(block.transactions.len(), ", $tx_len, ");")]
         #[doc = concat!("assert_eq!(hex::encode(block.hash()), \"", $hash, "\")")]
         /// ```
@@ -112,7 +112,7 @@ macro_rules! const_tx_blob {
         ///
         /// ```rust
         #[doc = "# use cuprate_test_utils::data::*;"]
-        #[doc = "use monero_serai::transaction::{Transaction, Timelock};"]
+        #[doc = "use monero_oxide::transaction::{Transaction, Timelock};"]
         #[doc = ""]
         #[doc = concat!("let tx = Transaction::read(&mut ", stringify!($name), ").unwrap();")]
         #[doc = ""]

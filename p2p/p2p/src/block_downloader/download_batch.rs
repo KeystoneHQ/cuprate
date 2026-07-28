@@ -1,8 +1,7 @@
 use std::collections::HashSet;
 
-use monero_serai::{block::Block, transaction::Transaction};
+use monero_oxide::{block::Block, transaction::Transaction};
 use rayon::prelude::*;
-use tokio::time::timeout;
 use tower::{Service, ServiceExt};
 use tracing::instrument;
 
@@ -16,7 +15,7 @@ use cuprate_wire::protocol::{GetObjectsRequest, GetObjectsResponse};
 
 use crate::{
     block_downloader::{BlockBatch, BlockDownloadError, BlockDownloadTaskResponse},
-    constants::{BLOCK_DOWNLOADER_REQUEST_TIMEOUT, MAX_TRANSACTION_BLOB_SIZE, MEDIUM_BAN},
+    constants::{MAX_TRANSACTION_BLOB_SIZE, MEDIUM_BAN},
     peer_set::ClientDropGuard,
 };
 
@@ -31,7 +30,7 @@ use crate::{
     )
 )]
 #[expect(clippy::used_underscore_binding)]
-pub async fn download_batch_task<N: NetworkZone>(
+pub(super) async fn download_batch_task<N: NetworkZone>(
     client: ClientDropGuard<N>,
     ids: ByteArrayVec<32>,
     previous_id: [u8; 32],
@@ -60,17 +59,15 @@ async fn request_batch_from_peer<N: NetworkZone>(
     }));
 
     // Request the blocks and add a timeout to the request
-    let blocks_response = timeout(BLOCK_DOWNLOADER_REQUEST_TIMEOUT, async {
+    let blocks_response = {
         let PeerResponse::Protocol(ProtocolResponse::GetObjects(blocks_response)) =
             client.ready().await?.call(request).await?
         else {
             panic!("Connection task returned wrong response.");
         };
 
-        Ok::<_, BlockDownloadError>(blocks_response)
-    })
-    .await
-    .map_err(|_| BlockDownloadError::TimedOut)??;
+        blocks_response
+    };
 
     // Initial sanity checks
     if blocks_response.blocks.len() > ids.len() {
@@ -146,10 +143,7 @@ fn deserialize_batch(
 
             // Check the height lines up as expected.
             // This must happen after the hash check.
-            if block
-                .number()
-                .is_none_or(|height| height != expected_height)
-            {
+            if block.number() != expected_height {
                 tracing::warn!(
                     "Invalid chain, expected height: {expected_height}, got height: {:?}",
                     block.number()

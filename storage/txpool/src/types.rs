@@ -1,4 +1,4 @@
-//! Tx-pool [table](crate::tables) types.
+//! Tx-pool types.
 //!
 //! This module contains all types used by the database tables,
 //! and aliases for common  types that use the same underlying
@@ -6,7 +6,7 @@
 //!
 //! <!-- FIXME: Add schema here or a link to it when complete -->
 use bytemuck::{Pod, Zeroable};
-use monero_serai::transaction::Timelock;
+use monero_oxide::transaction::Timelock;
 
 use cuprate_types::{CachedVerificationState, HardFork};
 
@@ -31,6 +31,12 @@ bitflags::bitflags! {
     }
 }
 
+impl TxStateFlags {
+    pub const fn private(&self) -> bool {
+        self.contains(Self::STATE_STEM)
+    }
+}
+
 /// Information on a tx-pool transaction.
 #[derive(Copy, Clone, Debug, PartialEq, PartialOrd, Eq, Ord, Hash, Pod, Zeroable)]
 #[repr(C)]
@@ -39,13 +45,16 @@ pub struct TransactionInfo {
     pub fee: u64,
     /// The transaction's weight.
     pub weight: usize,
+    /// The UNIX timestamp of when this tx was received.
+    pub received_at: u64,
+    pub cached_verification_state: RawCachedVerificationState,
     /// [`TxStateFlags`] of this transaction.
     pub flags: TxStateFlags,
     #[expect(clippy::pub_underscore_fields)]
     /// Explicit padding so that we have no implicit padding bytes in `repr(C)`.
     ///
     /// Allows potential future expansion of this type.
-    pub _padding: [u8; 7],
+    pub _padding: [u8; 6],
 }
 
 /// [`CachedVerificationState`] in a format that can be stored into the database.
@@ -71,6 +80,13 @@ impl From<RawCachedVerificationState> for CachedVerificationState {
     fn from(value: RawCachedVerificationState) -> Self {
         // if the hash is all `0`s then there is no hash this is valid at.
         if value.raw_valid_at_hash == [0; 32] {
+            if value.raw_hf != 0 {
+                return Self::OnlySemantic(
+                    HardFork::from_version(value.raw_hf)
+                        .expect("hard-fork values stored in the DB should always be valid"),
+                );
+            }
+
             return Self::NotVerified;
         }
 
@@ -101,6 +117,11 @@ impl From<CachedVerificationState> for RawCachedVerificationState {
             CachedVerificationState::NotVerified => Self {
                 raw_valid_at_hash: [0; 32],
                 raw_hf: 0,
+                raw_valid_past_timestamp: [0; 8],
+            },
+            CachedVerificationState::OnlySemantic(hf) => Self {
+                raw_valid_at_hash: [0; 32],
+                raw_hf: hf.as_u8(),
                 raw_valid_past_timestamp: [0; 8],
             },
             CachedVerificationState::ValidAtHashAndHF { block_hash, hf } => Self {

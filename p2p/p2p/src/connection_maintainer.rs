@@ -15,7 +15,7 @@ use tower::{Service, ServiceExt};
 use tracing::{instrument, Instrument, Span};
 
 use cuprate_p2p_core::{
-    client::{Client, ConnectRequest, HandshakeError},
+    client::{Client, ConnectRequest, HandshakeError, PeerSyncCallback},
     services::{AddressBookRequest, AddressBookResponse},
     AddressBook, NetworkZone,
 };
@@ -43,9 +43,9 @@ pub struct MakeConnectionRequest {
 /// The outbound connection count keeper.
 ///
 /// This handles maintaining a minimum number of connections and making extra connections when needed, upto a maximum.
-pub struct OutboundConnectionKeeper<N: NetworkZone, A, C> {
+pub struct OutboundConnectionKeeper<Z: NetworkZone, A, C> {
     /// The pool of currently connected peers.
-    pub new_peers_tx: mpsc::Sender<Client<N>>,
+    pub new_peers_tx: mpsc::Sender<Client<Z>>,
     /// The channel that tells us to make new _extra_ outbound connections.
     pub make_connection_rx: mpsc::Receiver<MakeConnectionRequest>,
     /// The address book service
@@ -59,27 +59,30 @@ pub struct OutboundConnectionKeeper<N: NetworkZone, A, C> {
     /// we add a permit to the semaphore and keep track here, upto a value in config.
     pub extra_peers: usize,
     /// The p2p config.
-    pub config: P2PConfig<N>,
+    pub config: P2PConfig<Z>,
     /// The [`Bernoulli`] distribution, when sampled will return true if we should connect to a gray peer or
     /// false if we should connect to a white peer.
     ///
     /// This is weighted to the percentage given in `config`.
     pub peer_type_gen: Bernoulli,
+    /// A callback used to notify the syncer about peer sync state changes.
+    pub peer_sync_callback: Option<PeerSyncCallback>,
 }
 
-impl<N, A, C> OutboundConnectionKeeper<N, A, C>
+impl<Z, A, C> OutboundConnectionKeeper<Z, A, C>
 where
-    N: NetworkZone,
-    A: AddressBook<N>,
-    C: Service<ConnectRequest<N>, Response = Client<N>, Error = HandshakeError>,
+    Z: NetworkZone,
+    A: AddressBook<Z>,
+    C: Service<ConnectRequest<Z>, Response = Client<Z>, Error = HandshakeError>,
     C::Future: Send + 'static,
 {
     pub fn new(
-        config: P2PConfig<N>,
-        new_peers_tx: mpsc::Sender<Client<N>>,
+        config: P2PConfig<Z>,
+        new_peers_tx: mpsc::Sender<Client<Z>>,
         make_connection_rx: mpsc::Receiver<MakeConnectionRequest>,
         address_book_svc: A,
         connector_svc: C,
+        peer_sync_callback: Option<PeerSyncCallback>,
     ) -> Self {
         let peer_type_gen = Bernoulli::new(config.gray_peers_percent)
             .expect("Gray peer percent is incorrect should be 0..=1");
@@ -93,15 +96,12 @@ where
             extra_peers: 0,
             config,
             peer_type_gen,
+            peer_sync_callback,
         }
     }
 
     /// Connects to random seeds to get peers and immediately disconnects
     #[instrument(level = "info", skip(self))]
-    #[expect(
-        clippy::significant_drop_in_scrutinee,
-        clippy::significant_drop_tightening
-    )]
     async fn connect_to_random_seeds(&mut self) -> Result<(), OutboundConnectorError> {
         let seeds = self
             .config
@@ -117,23 +117,36 @@ where
         for seed in seeds {
             tracing::info!("Getting peers from seed node: {}", seed);
 
+            let addr = *seed;
             let fut = timeout(
                 HANDSHAKE_TIMEOUT,
                 self.connector_svc
                     .ready()
                     .await
                     .expect("Connector had an error in `poll_ready`")
-                    .call(ConnectRequest {
-                        addr: *seed,
-                        permit: None,
-                    }),
+                    .call(ConnectRequest { addr, permit: None }),
             );
             // Spawn the handshake on a separate task with a timeout, so we don't get stuck connecting to a peer.
-            handshake_futs.spawn(fut);
+            handshake_futs.spawn(
+                async move {
+                    match fut.await {
+                        Err(_) => {
+                            tracing::warn!("Timed out connecting to seed node: {addr}");
+                            false
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!("Failed to connect to seed node {addr}: {e}");
+                            false
+                        }
+                        Ok(Ok(_)) => true,
+                    }
+                }
+                .instrument(Span::current()),
+            );
         }
 
         while let Some(res) = handshake_futs.join_next().await {
-            if matches!(res, Err(_) | Ok(Err(_) | Ok(Err(_)))) {
+            if !res.unwrap_or(false) {
                 allowed_errors -= 1;
             }
         }
@@ -147,8 +160,9 @@ where
 
     /// Connects to a given outbound peer.
     #[instrument(level = "info", skip_all)]
-    async fn connect_to_outbound_peer(&mut self, permit: OwnedSemaphorePermit, addr: N::Addr) {
+    async fn connect_to_outbound_peer(&mut self, permit: OwnedSemaphorePermit, addr: Z::Addr) {
         let new_peers_tx = self.new_peers_tx.clone();
+        let peer_sync_callback = self.peer_sync_callback.clone();
         let connection_fut = self
             .connector_svc
             .ready()
@@ -161,9 +175,13 @@ where
 
         tokio::spawn(
             async move {
-                #[expect(clippy::significant_drop_in_scrutinee)]
                 if let Ok(Ok(peer)) = timeout(HANDSHAKE_TIMEOUT, connection_fut).await {
-                    drop(new_peers_tx.send(peer).await);
+                    let csd = peer.info.core_sync_data.lock().unwrap().clone();
+                    if new_peers_tx.send(peer).await.is_ok() {
+                        if let Some(ref peer_sync_callback) = peer_sync_callback {
+                            peer_sync_callback.call(&csd);
+                        }
+                    }
                 }
             }
             .instrument(Span::current()),

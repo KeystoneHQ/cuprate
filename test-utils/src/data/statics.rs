@@ -9,7 +9,7 @@
 use std::sync::LazyLock;
 
 use hex_literal::hex;
-use monero_serai::{block::Block, transaction::Transaction};
+use monero_oxide::{block::Block, transaction::Transaction};
 
 use cuprate_helper::{map::combine_low_high_bits_to_u128, tx::tx_fee};
 use cuprate_types::{VerifiedBlockInformation, VerifiedTransactionInformation};
@@ -20,7 +20,7 @@ use crate::data::constants::{
 };
 
 //---------------------------------------------------------------------------------------------------- Conversion
-/// Converts [`monero_serai::Block`] into a
+/// Converts [`monero_oxide::Block`] into a
 /// [`VerifiedBlockInformation`] (superset).
 ///
 /// To prevent pulling other code in order to actually calculate things
@@ -99,13 +99,18 @@ impl VerifiedBlockMap {
 
 // Same as [`VerifiedBlockMap`] but for [`VerifiedTransactionInformation`].
 fn to_tx_verification_data(tx_blob: impl AsRef<[u8]>) -> VerifiedTransactionInformation {
-    let tx_blob = tx_blob.as_ref().to_vec();
-    let tx = Transaction::read(&mut tx_blob.as_slice()).unwrap();
+    let tx = Transaction::read(&mut tx_blob.as_ref()).unwrap();
+    let tx_weight = tx.weight();
+    let fee = tx_fee(&tx);
+    let tx_hash = tx.hash();
+
+    let (tx, tx_prunable_blob) = tx.pruned_with_prunable();
     VerifiedTransactionInformation {
-        tx_weight: tx.weight(),
-        fee: tx_fee(&tx),
-        tx_hash: tx.hash(),
-        tx_blob,
+        tx_weight,
+        fee,
+        tx_hash,
+        tx_prunable_blob,
+        tx_pruned: tx.serialize(),
         tx,
     }
 }
@@ -246,8 +251,7 @@ macro_rules! transaction_verification_data {
         #[doc = "# use cuprate_test_utils::data::*;"]
         #[doc = "# use hex_literal::hex;"]
         #[doc = concat!("let tx = &*", stringify!($name), ";")]
-        #[doc = concat!("assert_eq!(&tx.tx.serialize(), ", stringify!($tx_blob), ");")]
-        #[doc = concat!("assert_eq!(tx.tx_blob, ", stringify!($tx_blob), ");")]
+        #[doc = concat!("assert_eq!([tx.tx_pruned.as_slice(), tx.tx_prunable_blob.as_slice()].concat(), ", stringify!($tx_blob), ");")]
         #[doc = concat!("assert_eq!(tx.tx_weight, ", $weight, ");")]
         #[doc = concat!("assert_eq!(tx.tx_hash, hex!(\"", $hash, "\"));")]
         /// ```

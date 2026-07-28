@@ -17,8 +17,12 @@ const TEST_LAG: usize = 2;
 
 const TEST_TOTAL_ACCOUNTED_BLOCKS: usize = TEST_WINDOW + TEST_LAG;
 
-pub(crate) const TEST_DIFFICULTY_CONFIG: DifficultyCacheConfig =
-    DifficultyCacheConfig::new(TEST_WINDOW, TEST_CUT, TEST_LAG);
+pub(crate) const TEST_DIFFICULTY_CONFIG: DifficultyCacheConfig = DifficultyCacheConfig {
+    window: TEST_WINDOW,
+    cut: TEST_CUT,
+    lag: TEST_LAG,
+    fixed_difficulty: None,
+};
 
 #[tokio::test]
 async fn first_3_blocks_fixed_difficulty() -> Result<(), tower::BoxError> {
@@ -168,7 +172,7 @@ proptest! {
             // we dont need cumulative_difficulties
             cumulative_difficulties: VecDeque::new(),
         };
-        // add the genesis blocks timestamp (always 0)
+        // add the genesis block's timestamp (always 0)
         timestamps.push_front(0);
         timestamps.make_contiguous().sort_unstable();
         prop_assert_eq!(median(timestamps.make_contiguous()), diff_cache.median_timestamp(TEST_WINDOW).unwrap());
@@ -186,7 +190,7 @@ proptest! {
     }
 
     #[test]
-    fn claculating_multiple_diffs_does_not_change_state(
+    fn calculating_multiple_diffs_does_not_change_state(
         diff_cache in random_difficulty_cache(),
         timestamps in any_with::<Vec<u64>>(size_range(0..1000).lift()),
         hf in any::<HardFork>(),

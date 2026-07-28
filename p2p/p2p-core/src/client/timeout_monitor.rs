@@ -15,7 +15,7 @@ use tracing::instrument;
 use cuprate_wire::{admin::TimedSyncRequest, AdminRequestMessage, AdminResponseMessage};
 
 use crate::{
-    client::{connection::ConnectionTaskRequest, PeerInformation},
+    client::{connection::ConnectionTaskRequest, PeerInformation, PeerSyncCallback},
     constants::{MAX_PEERS_IN_PEER_LIST_MESSAGE, TIMEOUT_INTERVAL},
     services::{AddressBookRequest, CoreSyncDataRequest, CoreSyncDataResponse},
     AddressBook, CoreSyncSvc, NetworkZone, PeerRequest, PeerResponse,
@@ -28,7 +28,7 @@ use crate::{
     fields(addr = %peer_information.id),
     skip_all,
 )]
-pub async fn connection_timeout_monitor_task<N: NetworkZone, AdrBook, CSync>(
+pub(super) async fn connection_timeout_monitor_task<N: NetworkZone, AdrBook, CSync>(
     peer_information: PeerInformation<N::Addr>,
 
     connection_tx: mpsc::Sender<ConnectionTaskRequest>,
@@ -36,6 +36,7 @@ pub async fn connection_timeout_monitor_task<N: NetworkZone, AdrBook, CSync>(
 
     mut address_book_svc: AdrBook,
     mut core_sync_svc: CSync,
+    on_peer_sync: Option<PeerSyncCallback>,
 ) -> Result<(), tower::BoxError>
 where
     AdrBook: AddressBook<N>,
@@ -54,7 +55,13 @@ where
     interval.tick().await;
 
     loop {
-        interval.tick().await;
+        tokio::select! {
+            () = peer_information.handle.closed() => {
+                tracing::debug!("Closing timeout monitor, connection disconnected.");
+                return Ok(());
+            }
+            _ = interval.tick() => ()
+        }
 
         tracing::trace!("timeout monitor tick.");
 
@@ -113,6 +120,7 @@ where
             .ready()
             .await?
             .call(AddressBookRequest::IncomingPeerList(
+                peer_information.id,
                 timed_sync
                     .local_peerlist_new
                     .into_iter()
@@ -121,6 +129,10 @@ where
             ))
             .await?;
 
-        *peer_information.core_sync_data.lock().unwrap() = timed_sync.payload_data;
+        *peer_information.core_sync_data.lock().unwrap() = timed_sync.payload_data.clone();
+
+        if let Some(on_peer_sync) = &on_peer_sync {
+            on_peer_sync.call(&timed_sync.payload_data);
+        }
     }
 }

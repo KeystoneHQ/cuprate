@@ -1,24 +1,26 @@
 //! # Blockchain Context
 //!
-//! This crate contains a service to get cached context from the blockchain: [`BlockChainContext`].
+//! This crate contains a service to get cached context from the blockchain: [`BlockchainContext`].
 //! This is used during contextual validation, this does not have all the data for contextual validation
 //! (outputs) for that you will need a [`Database`].
 
 // Used in documentation references for [`BlockChainContextRequest`]
 // FIXME: should we pull in a dependency just to link docs?
-use monero_serai as _;
+use monero_oxide as _;
 
 use std::{
     cmp::min,
     collections::HashMap,
     future::Future,
+    num::NonZero,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
 
+use arc_swap::Cache;
 use futures::{channel::oneshot, FutureExt};
-use monero_serai::block::Block;
+use monero_oxide::block::Block;
 use tokio::sync::mpsc;
 use tokio_util::sync::PollSender;
 use tower::Service;
@@ -28,15 +30,18 @@ use cuprate_consensus_rules::{
 };
 
 pub mod difficulty;
+pub mod distribution;
 pub mod hardforks;
 pub mod rx_vms;
 pub mod weight;
 
 mod alt_chains;
 mod task;
-mod tokens;
 
-use cuprate_types::{Chain, ChainInfo, FeeEstimate, HardForkInfo};
+use cuprate_types::{
+    rpc::{ChainInfo, FeeEstimate, HardForkInfo, OutputDistributionData},
+    Chain,
+};
 use difficulty::DifficultyCache;
 use rx_vms::RandomXVm;
 use weight::BlockWeightsCache;
@@ -44,7 +49,6 @@ use weight::BlockWeightsCache;
 pub use alt_chains::{sealed::AltChainRequestToken, AltChainContextCache};
 pub use difficulty::DifficultyCacheConfig;
 pub use hardforks::HardForkConfig;
-pub use tokens::*;
 pub use weight::BlockWeightsCacheConfig;
 
 pub const BLOCKCHAIN_TIMESTAMP_CHECK_WINDOW: u64 = 60;
@@ -88,6 +92,15 @@ impl ContextConfig {
             weights_config: BlockWeightsCacheConfig::main_net(),
         }
     }
+
+    /// Get the config for fake-chain (regtest).
+    pub const fn fake_chain() -> Self {
+        Self {
+            hard_fork_cfg: HardForkConfig::fake_chain(),
+            difficulty_cfg: DifficultyCacheConfig::main_net(),
+            weights_config: BlockWeightsCacheConfig::main_net(),
+        }
+    }
 }
 
 /// Initialize the blockchain context service.
@@ -96,30 +109,32 @@ impl ContextConfig {
 pub async fn initialize_blockchain_context<D>(
     cfg: ContextConfig,
     database: D,
-) -> Result<BlockChainContextService, ContextCacheError>
+) -> Result<BlockchainContextService, ContextCacheError>
 where
     D: Database + Clone + Send + Sync + 'static,
     D::Future: Send + 'static,
 {
-    let context_task = task::ContextTask::init_context(cfg, database).await?;
+    let (context_task, context_cache) = task::ContextTask::init_context(cfg, database).await?;
 
     // TODO: make buffer size configurable.
     let (tx, rx) = mpsc::channel(15);
 
     tokio::spawn(context_task.run(rx));
 
-    Ok(BlockChainContextService {
+    Ok(BlockchainContextService {
+        cached_context: Cache::new(context_cache),
+
         channel: PollSender::new(tx),
     })
 }
 
-/// Raw blockchain context, gotten from [`BlockChainContext`]. This data may turn invalid so is not ok to keep
-/// around. You should keep around [`BlockChainContext`] instead.
-#[derive(Debug, Clone)]
-pub struct RawBlockChainContext {
+/// Raw blockchain context, gotten from [`BlockchainContext`]. This data may turn invalid so is not ok to keep
+/// around. You should keep around [`BlockchainContext`] instead.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct BlockchainContext {
     /// The current cumulative difficulty.
     pub cumulative_difficulty: u128,
-    /// Context to verify a block, as needed by [`cuprate-consensus-rules`]
+    /// Context to verify a block, as needed by [`cuprate_consensus_rules`]
     pub context_to_verify_block: ContextToVerifyBlock,
     /// The median long term block weight.
     median_long_term_weight: usize,
@@ -127,34 +142,34 @@ pub struct RawBlockChainContext {
     top_block_timestamp: Option<u64>,
 }
 
-impl std::ops::Deref for RawBlockChainContext {
+impl std::ops::Deref for BlockchainContext {
     type Target = ContextToVerifyBlock;
     fn deref(&self) -> &Self::Target {
         &self.context_to_verify_block
     }
 }
 
-impl RawBlockChainContext {
+impl BlockchainContext {
     /// Returns the timestamp the should be used when checking locked outputs.
     ///
     /// ref: <https://cuprate.github.io/monero-book/consensus_rules/transactions/unlock_time.html#getting-the-current-time>
     pub fn current_adjusted_timestamp_for_time_lock(&self) -> u64 {
-        if self.current_hf < HardFork::V13 || self.median_block_timestamp.is_none() {
-            current_unix_timestamp()
-        } else {
-            // This is safe as we just checked if this was None.
-            let median = self.median_block_timestamp.unwrap();
-
-            let adjusted_median = median
-                + (BLOCKCHAIN_TIMESTAMP_CHECK_WINDOW + 1) * self.current_hf.block_time().as_secs()
-                    / 2;
-
-            // This is safe as we just checked if the median was None and this will only be none for genesis and the first block.
-            let adjusted_top_block =
-                self.top_block_timestamp.unwrap() + self.current_hf.block_time().as_secs();
-
-            min(adjusted_median, adjusted_top_block)
+        // FIXME: use if let chain with Rust 2024.
+        if self.current_hf < HardFork::V13 {
+            return current_unix_timestamp();
         }
+
+        let Some(median) = self.median_block_timestamp else {
+            return current_unix_timestamp();
+        };
+
+        let block_time = self.current_hf.block_time().as_secs();
+        let adjusted_median = median + (BLOCKCHAIN_TIMESTAMP_CHECK_WINDOW + 1) * block_time / 2;
+
+        // This is safe as we just checked if the median was None and this will only be none for genesis and the first block.
+        let adjusted_top_block = self.top_block_timestamp.unwrap() + block_time;
+
+        min(adjusted_median, adjusted_top_block)
     }
 
     /// Returns the next blocks long term weight from its block weight.
@@ -167,68 +182,33 @@ impl RawBlockChainContext {
     }
 }
 
-/// Blockchain context which keeps a token of validity so users will know when the data is no longer valid.
-#[derive(Debug, Clone)]
-pub struct BlockChainContext {
-    /// A token representing this data's validity.
-    validity_token: ValidityToken,
-    /// The actual block chain context.
-    raw: RawBlockChainContext,
-}
-
-#[derive(Debug, Clone, Copy, thiserror::Error)]
-#[error("data is no longer valid")]
-pub struct DataNoLongerValid;
-
-impl BlockChainContext {
-    /// Checks if the data is still valid.
-    pub fn is_still_valid(&self) -> bool {
-        self.validity_token.is_data_valid()
-    }
-
-    /// Checks if the data is valid returning an Err if not and a reference to the blockchain context if
-    /// it is.
-    pub fn blockchain_context(&self) -> Result<&RawBlockChainContext, DataNoLongerValid> {
-        if !self.is_still_valid() {
-            return Err(DataNoLongerValid);
-        }
-        Ok(&self.raw)
-    }
-
-    /// Returns the blockchain context without checking the validity token.
-    pub const fn unchecked_blockchain_context(&self) -> &RawBlockChainContext {
-        &self.raw
-    }
-}
-
 /// Data needed from a new block to add it to the context cache.
 #[derive(Debug, Clone)]
 pub struct NewBlockData {
-    /// The blocks hash.
+    /// The block's hash.
     pub block_hash: [u8; 32],
-    /// The blocks height.
+    /// The block's height.
     pub height: usize,
-    /// The blocks timestamp.
+    /// The block's timestamp.
     pub timestamp: u64,
-    /// The blocks weight.
+    /// The block's weight.
     pub weight: usize,
     /// long term weight of this block.
     pub long_term_weight: usize,
     /// The coins generated by this block.
     pub generated_coins: u64,
-    /// The blocks hf vote.
+    /// The block's hf vote.
     pub vote: HardFork,
     /// The cumulative difficulty of the chain.
     pub cumulative_difficulty: u128,
+    /// The number of RCT outputs in this block.
+    pub numb_rct_outputs: usize,
 }
 
 /// A request to the blockchain context cache.
 #[derive(Debug, Clone)]
 pub enum BlockChainContextRequest {
-    /// Get the current blockchain context.
-    Context,
-
-    /// Gets all the current  `RandomX` VMs.
+    /// Gets all the current RandomX VMs.
     CurrentRxVms,
 
     /// Get the next difficulties for these blocks.
@@ -259,13 +239,23 @@ pub enum BlockChainContextRequest {
         numb_blocks: usize,
     },
 
-    /// Get information on a certain hardfork.
-    HardForkInfo(HardFork),
+    /// Get information on all hardforks.
+    HardForkInfos,
 
     /// Get the current fee estimate.
     FeeEstimate {
         /// TODO
         grace_blocks: u64,
+    },
+
+    /// Get the RCT output distribution.
+    RctOutputDistribution {
+        /// The height to start the distribution from.
+        from_height: u64,
+        /// The height to end the distribution at, [`None`] means the top block.
+        to_height: Option<NonZero<u64>>,
+        /// Whether the distribution should be cumulative.
+        cumulative: bool,
     },
 
     /// Calculate proof-of-work for this block.
@@ -295,42 +285,42 @@ pub enum BlockChainContextRequest {
     /// This variant is private and is not callable from outside this crate, the block verifier service will
     /// handle getting the alt cache.
     AltChainContextCache {
-        /// The previous block field in a [`BlockHeader`](monero_serai::block::BlockHeader).
+        /// The previous block field in a [`BlockHeader`](monero_oxide::block::BlockHeader).
         prev_id: [u8; 32],
         /// An internal token to prevent external crates calling this request.
         _token: AltChainRequestToken,
     },
 
-    /// A request for a difficulty cache of an alternative chin.
+    /// A request for a difficulty cache of an alternative chain.
     ///
     /// This variant is private and is not callable from outside this crate, the block verifier service will
     /// handle getting the difficulty cache of an alt chain.
     AltChainDifficultyCache {
-        /// The previous block field in a [`BlockHeader`](monero_serai::block::BlockHeader).
+        /// The previous block field in a [`BlockHeader`](monero_oxide::block::BlockHeader).
         prev_id: [u8; 32],
         /// An internal token to prevent external crates calling this request.
         _token: AltChainRequestToken,
     },
 
-    /// A request for a block weight cache of an alternative chin.
+    /// A request for a block weight cache of an alternative chain.
     ///
     /// This variant is private and is not callable from outside this crate, the block verifier service will
     /// handle getting the weight cache of an alt chain.
     AltChainWeightCache {
-        /// The previous block field in a [`BlockHeader`](monero_serai::block::BlockHeader).
+        /// The previous block field in a [`BlockHeader`](monero_oxide::block::BlockHeader).
         prev_id: [u8; 32],
         /// An internal token to prevent external crates calling this request.
         _token: AltChainRequestToken,
     },
 
-    /// A request for a RX VM for an alternative chin.
+    /// A request for a RX VM for an alternative chain.
     ///
     /// Response variant: [`BlockChainContextResponse::AltChainRxVM`].
     ///
     /// This variant is private and is not callable from outside this crate, the block verifier service will
     /// handle getting the randomX VM of an alt chain.
     AltChainRxVM {
-        /// The height the `RandomX` VM is needed for.
+        /// The height the RandomX VM is needed for.
         height: usize,
         /// The chain to look in for the seed.
         chain: Chain,
@@ -343,8 +333,6 @@ pub enum BlockChainContextRequest {
     /// This variant is private and is not callable from outside this crate, the block verifier service will
     /// handle returning the alt cache to the context service.
     AddAltChainContextCache {
-        /// The previous block field in a [`BlockHeader`](monero_serai::block::BlockHeader).
-        prev_id: [u8; 32],
         /// The cache.
         cache: Box<AltChainContextCache>,
         /// An internal token to prevent external crates calling this request.
@@ -363,22 +351,22 @@ pub enum BlockChainContextResponse {
     /// - [`BlockChainContextRequest::AddAltChainContextCache`]
     Ok,
 
-    /// Response to [`BlockChainContextRequest::Context`]
-    Context(BlockChainContext),
-
     /// Response to [`BlockChainContextRequest::CurrentRxVms`]
     ///
-    /// A map of seed height to `RandomX` VMs.
+    /// A map of seed height to RandomX VMs.
     RxVms(HashMap<usize, Arc<RandomXVm>>),
 
     /// A list of difficulties.
     BatchDifficulties(Vec<u128>),
 
-    /// Response to [`BlockChainContextRequest::HardForkInfo`]
-    HardForkInfo(HardForkInfo),
+    /// Response to [`BlockChainContextRequest::HardForkInfos`]
+    HardForkInfos(Vec<HardForkInfo>),
 
     /// Response to [`BlockChainContextRequest::FeeEstimate`]
     FeeEstimate(FeeEstimate),
+
+    /// Response to [`BlockChainContextRequest::RctOutputDistribution`]
+    RctOutputDistribution(OutputDistributionData),
 
     /// Response to [`BlockChainContextRequest::CalculatePow`]
     CalculatePow([u8; 32]),
@@ -403,11 +391,25 @@ pub enum BlockChainContextResponse {
 
 /// The blockchain context service.
 #[derive(Clone)]
-pub struct BlockChainContextService {
+pub struct BlockchainContextService {
+    cached_context: Cache<Arc<arc_swap::ArcSwap<BlockchainContext>>, Arc<BlockchainContext>>,
+
     channel: PollSender<task::ContextTaskRequest>,
 }
 
-impl Service<BlockChainContextRequest> for BlockChainContextService {
+impl BlockchainContextService {
+    /// Get the current [`BlockchainContext`] from the cache.
+    pub fn blockchain_context(&mut self) -> &BlockchainContext {
+        self.cached_context.load()
+    }
+
+    /// Get a snapshot of the current [`BlockchainContext`].
+    pub fn blockchain_context_snapshot(&self) -> arc_swap::Guard<Arc<BlockchainContext>> {
+        self.cached_context.arc_swap().load()
+    }
+}
+
+impl Service<BlockChainContextRequest> for BlockchainContextService {
     type Response = BlockChainContextResponse;
     type Error = tower::BoxError;
     type Future =

@@ -31,7 +31,7 @@ prop_compose! {
                    ) -> DummyDatabase {
         let mut builder = DummyDatabaseBuilder::default();
 
-        blocks.sort_by(|a, b| a.cumulative_difficulty.cmp(&b.cumulative_difficulty));
+        blocks.sort_by_key(|a| a.cumulative_difficulty);
 
         for block in blocks {
             builder.add_block(block);
@@ -141,6 +141,10 @@ impl Service<BlockchainReadRequest> for DummyDatabase {
         let dummy_height = self.dummy_height;
 
         async move {
+            #[expect(
+                clippy::wildcard_enum_match_arm,
+                reason = "the context svc should not need other requests"
+            )]
             Ok(match req {
                 BlockchainReadRequest::BlockExtendedHeader(id) => {
                     let mut id = id;
@@ -169,11 +173,17 @@ impl Service<BlockchainReadRequest> for DummyDatabase {
                     let mut end = range.end;
                     let mut start = range.start;
 
+                    let block_len = blocks.read().unwrap().len();
                     if let Some(dummy_height) = dummy_height {
-                        let block_len = blocks.read().unwrap().len();
-
                         end -= dummy_height - block_len;
                         start -= dummy_height - block_len;
+                    }
+
+                    if block_len < end {
+                        return Err(format!(
+                            "end block not in database! end: {end} len: {block_len}"
+                        )
+                        .into());
                     }
 
                     BlockchainResponse::BlockExtendedHeaderInRange(
@@ -197,6 +207,9 @@ impl Service<BlockchainReadRequest> for DummyDatabase {
                     BlockchainResponse::ChainHeight(height, top_hash)
                 }
                 BlockchainReadRequest::GeneratedCoins(_) => BlockchainResponse::GeneratedCoins(0),
+                BlockchainReadRequest::CumulativeRctOutsInRange(range) => {
+                    BlockchainResponse::CumulativeRctOutsInRange(vec![0; range.len()])
+                }
                 _ => unimplemented!("the context svc should not need these requests!"),
             })
         }

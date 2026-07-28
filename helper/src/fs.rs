@@ -163,10 +163,10 @@ impl_path_lazylock! {
 /// Joins the [`Network`] to the [`Path`].
 ///
 /// This will keep the path the same for [`Network::Mainnet`].
-fn path_with_network(path: &Path, network: Network) -> PathBuf {
+pub fn path_with_network(path: &Path, network: Network) -> PathBuf {
     match network {
         Network::Mainnet => path.to_path_buf(),
-        network => path.join(network.to_string()),
+        Network::Testnet | Network::Stagenet | Network::FakeChain => path.join(network.to_string()),
     }
 }
 
@@ -200,6 +200,21 @@ pub fn txpool_path(data_dir: &Path, network: Network) -> PathBuf {
     path_with_network(data_dir, network).join("txpool")
 }
 
+/// Cuprate's logs directory.
+///
+/// This is the PATH used for all Cuprate log files.
+///
+/// ```rust
+/// use cuprate_helper::{network::Network, fs::{CUPRATE_DATA_DIR, logs_path}};
+///
+/// assert_eq!(logs_path(&**CUPRATE_DATA_DIR, Network::Mainnet).as_path(), CUPRATE_DATA_DIR.join("logs"));
+/// assert_eq!(logs_path(&**CUPRATE_DATA_DIR, Network::Stagenet).as_path(), CUPRATE_DATA_DIR.join(Network::Stagenet.to_string()).join("logs"));
+/// assert_eq!(logs_path(&**CUPRATE_DATA_DIR, Network::Testnet).as_path(), CUPRATE_DATA_DIR.join(Network::Testnet.to_string()).join("logs"));
+/// ```
+pub fn logs_path(data_dir: &Path, network: Network) -> PathBuf {
+    path_with_network(data_dir, network).join("logs")
+}
+
 /// Cuprate's address-book directory.
 ///
 /// This is the PATH used for any Cuprate address-book files.
@@ -213,6 +228,34 @@ pub fn txpool_path(data_dir: &Path, network: Network) -> PathBuf {
 /// ```
 pub fn address_book_path(cache_dir: &Path, network: Network) -> PathBuf {
     path_with_network(cache_dir, network).join("addressbook")
+}
+
+// Set global private permissions for created files.
+//
+// # Unix
+// `rwxr-x---`
+//
+// # Windows
+// TODO: does nothing.
+#[cfg_attr(
+    target_os = "windows",
+    expect(
+        clippy::missing_const_for_fn,
+        reason = "remove when Windows is implemented"
+    )
+)]
+pub fn set_private_global_file_permissions() {
+    #[cfg(target_family = "unix")]
+    // SAFETY: calling C.
+    unsafe {
+        target_os_lib::umask(0o027);
+    }
+
+    #[cfg(target_os = "windows")]
+    // TODO: impl for Windows.
+    {
+        use target_os_lib as _;
+    }
 }
 
 //---------------------------------------------------------------------------------------------------- Tests
@@ -249,7 +292,7 @@ mod test {
             array[0].1 = ".cache/cuprate";
             array[1].1 = ".config/cuprate";
             array[2].1 = ".local/share/cuprate";
-        };
+        }
 
         for (path, expected) in array {
             assert!(path.is_absolute());

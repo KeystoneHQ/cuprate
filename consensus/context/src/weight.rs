@@ -14,12 +14,24 @@ use std::{
 use tower::ServiceExt;
 use tracing::instrument;
 
-use cuprate_consensus_rules::blocks::{penalty_free_zone, PENALTY_FREE_ZONE_5};
+use cuprate_consensus_rules::{
+    blocks::{penalty_free_zone, PENALTY_FREE_ZONE_5},
+    miner_tx::calculate_block_reward,
+};
 use cuprate_helper::{asynch::rayon_spawn_async, num::RollingMedian};
 use cuprate_types::{
     blockchain::{BlockchainReadRequest, BlockchainResponse},
+    rpc::FeeEstimate,
     Chain,
 };
+
+/// <https://github.com/monero-project/monero/blob/cc73fe71162d564ffda8e549b79a350bca53c454/src/cryptonote_config.h#L75>
+const DYNAMIC_FEE_REFERENCE_TX_WEIGHT: u64 = 3_000;
+/// <https://github.com/monero-project/monero/blob/cc73fe71162d564ffda8e549b79a350bca53c454/src/cryptonote_config.h#L193>
+const FEE_ROUNDING_PLACES: u32 = 2;
+/// <https://github.com/monero-project/monero/blob/cc73fe71162d564ffda8e549b79a350bca53c454/src/cryptonote_config.h#L192>
+/// <https://github.com/monero-project/monero/blob/cc73fe71162d564ffda8e549b79a350bca53c454/src/cryptonote_core/blockchain.h#L629>
+const FEE_QUANTIZATION_MASK: u64 = 10_000;
 
 use crate::{ContextCacheError, Database, HardFork};
 
@@ -137,27 +149,33 @@ impl BlockWeightsCache {
 
         let chain_height = self.tip_height + 1;
 
-        let new_long_term_start_height = chain_height
-            .saturating_sub(self.config.long_term_window)
-            .saturating_sub(numb_blocks);
+        let new_long_term_start_height =
+            chain_height.saturating_sub(self.config.long_term_window + numb_blocks);
 
         let old_long_term_weights = get_long_term_weight_in_range(
-            new_long_term_start_height
-                // current_chain_height - self.long_term_weights.len() blocks are already in the cache.
-                ..(chain_height - self.long_term_weights.window_len()),
+            new_long_term_start_height..
+                // We don't need to handle the case where this is above the top block like with the
+                // short term cache as we check at the top of this function and just create a new cache.
+                (chain_height - self.long_term_weights.window_len()),
             database.clone(),
             Chain::Main,
         )
         .await?;
 
-        let new_short_term_start_height = chain_height
-            .saturating_sub(self.config.short_term_window)
-            .saturating_sub(numb_blocks);
+        let new_short_term_start_height =
+            chain_height.saturating_sub(self.config.short_term_window + numb_blocks);
 
         let old_short_term_weights = get_blocks_weight_in_range(
             new_short_term_start_height
-                // current_chain_height - self.long_term_weights.len() blocks are already in the cache.
-                ..(chain_height - self.short_term_block_weights.window_len()),
+                ..(
+                    // the smallest between ...
+                    min(
+                        // the blocks we already have in the cache.
+                        chain_height - self.short_term_block_weights.window_len(),
+                        // the new chain height.
+                        chain_height - numb_blocks,
+                    )
+                ),
             database,
             Chain::Main,
         )
@@ -228,6 +246,66 @@ impl BlockWeightsCache {
         }
         .max(penalty_free_zone(hf))
     }
+
+    /// Computes the 2021 fee estimates.
+    ///
+    /// <https://github.com/monero-project/monero/blob/cc73fe71162d564ffda8e549b79a350bca53c454/src/cryptonote_core/blockchain.cpp#L3751>
+    pub fn fee_estimate_2021(
+        &self,
+        grace_blocks: u64,
+        hf: HardFork,
+        already_generated_coins: u64,
+    ) -> Result<FeeEstimate, tower::BoxError> {
+        /// Round an amount up to `significant_digits` significant decimal digits.
+        const fn round_money_up(amount: u64, significant_digits: u32) -> u64 {
+            if amount == 0 {
+                return 0;
+            }
+            let digits = amount.ilog10() + 1;
+            if digits <= significant_digits {
+                return amount;
+            }
+            let scale = 10_u64.pow(digits - significant_digits);
+            amount.div_ceil(scale) * scale
+        }
+
+        let grace = usize::try_from(grace_blocks).unwrap_or(usize::MAX);
+
+        if grace > SHORT_TERM_WINDOW {
+            return Err("Amount of grace blocks exceeds SHORT_TERM_WINDOW".into());
+        }
+
+        let mlw = max(
+            self.long_term_weights.median_with_grace(grace),
+            PENALTY_FREE_ZONE_5,
+        );
+
+        let msw = max(self.short_term_block_weights.median_with_grace(grace), mlw);
+
+        let mnw = min(msw, 50 * mlw);
+
+        let base_reward = calculate_block_reward(1, mlw, already_generated_coins, hf);
+
+        let mfw = min(mnw, mlw);
+
+        let fl = base_reward * DYNAMIC_FEE_REFERENCE_TX_WEIGHT / (mfw * mfw) as u64;
+        let fn_ = 4 * base_reward * DYNAMIC_FEE_REFERENCE_TX_WEIGHT / (mfw * mfw) as u64;
+        let fm =
+            16 * base_reward * DYNAMIC_FEE_REFERENCE_TX_WEIGHT / (PENALTY_FREE_ZONE_5 * mfw) as u64;
+        let fh = max(
+            4 * fm,
+            4 * fm * mfw as u64
+                / (32 * DYNAMIC_FEE_REFERENCE_TX_WEIGHT * mnw as u64 / PENALTY_FREE_ZONE_5 as u64),
+        );
+
+        let fees = [fl, fn_, fm, fh].map(|f| round_money_up(f, FEE_ROUNDING_PLACES));
+
+        Ok(FeeEstimate {
+            fee: fees[0],
+            fees: fees.to_vec(),
+            quantization_mask: FEE_QUANTIZATION_MASK,
+        })
+    }
 }
 
 /// Calculates the effective median with the long term and short term median.
@@ -257,7 +335,7 @@ fn calculate_effective_median_block_weight(
     effective_median.max(penalty_free_zone(hf))
 }
 
-/// Calculates a blocks long term weight.
+/// Calculates a block's long term weight.
 pub fn calculate_block_long_term_weight(
     hf: HardFork,
     block_weight: usize,

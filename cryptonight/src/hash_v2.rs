@@ -1,6 +1,4 @@
 use crate::slow_hash::{Variant, MEMORY_BLOCKS};
-extern crate alloc;
-use alloc::vec::Vec;
 
 const U64_MASK: u128 = u64::MAX as u128;
 
@@ -37,29 +35,29 @@ pub(crate) fn variant2_shuffle_add(
     let chunk1 = &mut long_state[chunk1_start];
     let sum1 = chunk3_old.wrapping_add(b1) & U64_MASK;
     let sum2 = (chunk3_old >> 64).wrapping_add(b1 >> 64) & U64_MASK;
-    *chunk1 = sum2 << 64 | sum1; // TODO remove some shifting above
+    *chunk1 = (sum2 << 64) | sum1; // TODO remove some shifting above
 
     let chunk3 = &mut long_state[chunk3_start];
     let sum1 = chunk2_old.wrapping_add(a) & U64_MASK;
     let sum2 = (chunk2_old >> 64).wrapping_add(a >> 64) & U64_MASK;
-    *chunk3 = sum2 << 64 | sum1;
+    *chunk3 = (sum2 << 64) | sum1;
 
     let b0 = b[0];
     let chunk2 = &mut long_state[chunk2_start];
     let sum1 = chunk1_old.wrapping_add(b0) & U64_MASK;
     let sum2 = (chunk1_old >> 64).wrapping_add(b0 >> 64) & U64_MASK;
-    *chunk2 = sum2 << 64 | sum1;
+    *chunk2 = (sum2 << 64) | sum1;
 
     if variant == Variant::R {
         *c1 ^= chunk1_old ^ chunk2_old ^ chunk3_old;
     }
 }
 
-#[feature(expect(
+#[expect(
     clippy::cast_sign_loss,
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation
-))]
+)]
 pub(crate) fn variant2_integer_math_sqrt(sqrt_input: u64) -> u64 {
     // Get an approximation using floating point math
     let mut sqrt_result =
@@ -90,7 +88,7 @@ pub(crate) fn variant2_integer_math_sqrt(sqrt_input: u64) -> u64 {
 
 /// Original C code:
 /// <https://github.com/monero-project/monero/blob/v0.18.3.4/src/crypto/slow-hash.c#L277-L283>
-#[feature(expect(clippy::cast_possible_truncation))]
+#[expect(clippy::cast_possible_truncation)]
 pub(crate) fn variant2_integer_math(
     c2: &mut u128,
     c1: u128,
@@ -386,7 +384,7 @@ mod tests {
 
     #[test]
     fn test_variant2_shuffle_add() {
-        #[feature(expect(clippy::cast_possible_truncation))]
+        #[expect(clippy::cast_possible_truncation)]
         // #[expect(clippy::cast_possible_truncation)]
         fn test(
             c1_hex: &str,
@@ -428,7 +426,7 @@ mod tests {
             for block in long_state {
                 hash.update(block.to_le_bytes());
             }
-            let hash = hex::encode(hash.finalize().as_slice());
+            let hash = hex::encode(hash.finalize());
 
             assert_eq!(hash, long_state_end_hash);
         }

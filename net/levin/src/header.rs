@@ -26,6 +26,7 @@ pub const HEADER_SIZE: usize = 33;
 
 /// Levin header flags
 #[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Flags(u32);
 
 bitflags! {
@@ -74,8 +75,10 @@ impl From<Flags> for u32 {
 
 /// The Header of a Bucket. This contains
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct BucketHead<C> {
     /// The network signature, should be `LEVIN_SIGNATURE` for Monero
+    #[cfg_attr(feature = "arbitrary", arbitrary(value = crate::MONERO_LEVIN_SIGNATURE))]
     pub signature: u64,
     /// The size of the body
     pub size: u64,

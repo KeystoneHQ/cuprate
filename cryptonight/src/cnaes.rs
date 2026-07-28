@@ -184,7 +184,7 @@ const fn substitute_word(word: u32) -> u32 {
 /// Extends the key in the same way as it is extended for AES256, but for
 /// Cryptonight's hash we only need to extend to 10 round keys instead of 15
 /// like AES256.
-#[feature(expect(clippy::cast_possible_truncation))]
+#[expect(clippy::cast_possible_truncation)]
 pub(crate) fn key_extend(key_bytes: &[u8; CN_AES_KEY_SIZE]) -> [u128; NUM_AES_ROUND_KEYS] {
     // NK comes from the AES specification, it is the number of 32-bit words in
     // the non-expanded key (For AES-256: 32/4 = 8)
@@ -224,8 +224,10 @@ pub(crate) fn key_extend(key_bytes: &[u8; CN_AES_KEY_SIZE]) -> [u128; NUM_AES_RO
         let w2 = w1 ^ ((pprev_key >> 64) as u32);
         let w3 = w2 ^ ((pprev_key >> 96) as u32);
 
-        expanded_key[i] =
-            u128::from(w0) | u128::from(w1) << 32 | u128::from(w2) << 64 | u128::from(w3) << 96;
+        expanded_key[i] = u128::from(w0)
+            | (u128::from(w1) << 32)
+            | (u128::from(w2) << 64)
+            | (u128::from(w3) << 96);
 
         w0_prev = w3;
     }
@@ -233,7 +235,7 @@ pub(crate) fn key_extend(key_bytes: &[u8; CN_AES_KEY_SIZE]) -> [u128; NUM_AES_RO
     expanded_key
 }
 
-#[feature(expect(clippy::cast_possible_truncation))]
+#[expect(clippy::cast_possible_truncation)]
 pub(crate) fn round_fwd(state: u128, key: u128) -> u128 {
     let mut r1 = CRYPTONIGHT_SBOX[usize::from(state as u8)];
     r1 ^= CRYPTONIGHT_SBOX[256 + usize::from((state >> 40) as u8)];
@@ -256,7 +258,7 @@ pub(crate) fn round_fwd(state: u128, key: u128) -> u128 {
     r4 ^= CRYPTONIGHT_SBOX[768 + usize::from((state >> 88) as u8)];
 
     let mut new_state =
-        u128::from(r4) << 96 | u128::from(r3) << 64 | u128::from(r2) << 32 | u128::from(r1);
+        (u128::from(r4) << 96) | (u128::from(r3) << 64) | (u128::from(r2) << 32) | u128::from(r1);
     new_state ^= key;
     new_state
 }
@@ -277,9 +279,9 @@ pub(crate) fn aesb_single_round(block: &mut u128, round_key: u128) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::hex_to_array;
     #[cfg(feature = "no_std")]
     use alloc::string::String;
-    use crate::util::hex_to_array;
 
     #[test]
     fn test_substitute_word() {

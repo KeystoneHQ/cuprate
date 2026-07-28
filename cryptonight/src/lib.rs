@@ -1,7 +1,10 @@
 #![cfg_attr(not(feature = "std"), no_std)]
+#![allow(
+    clippy::negative_feature_names,
+    reason = "keep the existing `no_std` feature for downstream compatibility"
+)]
 
-#[cfg(feature = "no_std")]
-#[macro_use]
+#[cfg(not(feature = "std"))]
 extern crate alloc;
 
 mod blake256;
@@ -41,11 +44,13 @@ pub fn cryptonight_hash_v1(buf: &[u8]) -> Result<[u8; 32], DataCanNotBeHashed> {
 }
 
 /// Calculates the `CryptoNight` v2 hash of buf.
+#[cfg(feature = "std")]
 pub fn cryptonight_hash_v2(buf: &[u8]) -> [u8; 32] {
     cn_slow_hash(buf, slow_hash::Variant::V2, 0)
 }
 
 /// Calculates the `CryptoNight` R hash of buf.
+#[cfg(feature = "std")]
 pub fn cryptonight_hash_r(buf: &[u8], height: u64) -> [u8; 32] {
     cn_slow_hash(buf, slow_hash::Variant::R, height)
 }

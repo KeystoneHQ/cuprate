@@ -49,6 +49,9 @@ pub(crate) const INBOUND_CONNECTION_COOL_DOWN: Duration = Duration::from_millis(
 /// The initial amount of chain requests to send to find the best chain to sync from.
 pub(crate) const INITIAL_CHAIN_REQUESTS_TO_SEND: usize = 3;
 
+/// The timeout for individual peer requests during initial chain search.
+pub(crate) const INITIAL_CHAIN_SEARCH_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The enforced maximum amount of blocks to request in a batch.
 ///
 /// Requesting more than this will cause the peer to disconnect and potentially lead to bans.
@@ -74,6 +77,9 @@ pub(crate) const MAX_DOWNLOAD_FAILURES: usize = 5;
 
 /// The amount of empty chain entries to receive before we assume we have found the top of the chain.
 pub(crate) const EMPTY_CHAIN_ENTRIES_BEFORE_TOP_ASSUMED: usize = 5;
+
+/// The amount of most recent block batches we use to calculate batch size.
+pub(crate) const MOST_RECENT_BATCH_WEIGHTS_FOR_BATCH_SIZE: usize = 100;
 
 #[cfg(test)]
 mod tests {

@@ -5,7 +5,9 @@
 //! `#[no_std]` compatible.
 
 //---------------------------------------------------------------------------------------------------- Use
-use monero_serai::transaction::Timelock;
+use core::net::Ipv4Addr;
+
+use monero_oxide::transaction::Timelock;
 
 use cuprate_constants::block::MAX_BLOCK_HEIGHT;
 
@@ -28,6 +30,7 @@ use crate::cast::{u64_to_usize, usize_to_u64};
 /// let high = u64::MAX;
 ///
 /// assert_eq!(split_u128_into_low_high_bits(value), (low, high));
+/// assert_eq!(split_u128_into_low_high_bits(0), (0, 0));
 /// ```
 #[inline]
 pub const fn split_u128_into_low_high_bits(value: u128) -> (u64, u64) {
@@ -52,11 +55,30 @@ pub const fn split_u128_into_low_high_bits(value: u128) -> (u64, u64) {
 /// let high = u64::MAX;
 ///
 /// assert_eq!(combine_low_high_bits_to_u128(low, high), value);
+/// assert_eq!(combine_low_high_bits_to_u128(0, 0), 0);
 /// ```
 #[inline]
 pub const fn combine_low_high_bits_to_u128(low_bits: u64, high_bits: u64) -> u128 {
     let res = (high_bits as u128) << 64;
     res | (low_bits as u128)
+}
+
+//---------------------------------------------------------------------------------------------------- IPv4
+/// Convert an [`Ipv4Addr`] to a [`u32`].
+///
+/// For why this exists, see: <https://architecture.cuprate.org/oddities/le-ipv4.html>.
+#[inline]
+pub const fn ipv4_from_u32(ip: u32) -> Ipv4Addr {
+    let [a, b, c, d] = ip.to_le_bytes();
+    Ipv4Addr::new(a, b, c, d)
+}
+
+/// Convert a [`u32`] to an [`Ipv4Addr`].
+///
+/// For why this exists, see: <https://architecture.cuprate.org/oddities/le-ipv4.html>.
+#[inline]
+pub const fn u32_from_ipv4(ip: Ipv4Addr) -> u32 {
+    u32::from_le_bytes(ip.octets())
 }
 
 //---------------------------------------------------------------------------------------------------- Timelock
@@ -73,7 +95,7 @@ pub const fn combine_low_high_bits_to_u128(low_bits: u64, high_bits: u64) -> u12
 ///
 /// ```rust
 /// # use cuprate_helper::map::*;
-/// # use monero_serai::transaction::*;
+/// # use monero_oxide::transaction::*;
 /// use cuprate_constants::block::{MAX_BLOCK_HEIGHT, MAX_BLOCK_HEIGHT_USIZE};
 /// assert_eq!(u64_to_timelock(0), Timelock::None);
 /// assert_eq!(u64_to_timelock(MAX_BLOCK_HEIGHT-1), Timelock::Block(MAX_BLOCK_HEIGHT_USIZE-1));
@@ -95,7 +117,7 @@ pub const fn u64_to_timelock(u: u64) -> Timelock {
 ///
 /// ```rust
 /// # use cuprate_helper::map::*;
-/// # use monero_serai::transaction::*;
+/// # use monero_oxide::transaction::*;
 /// use cuprate_constants::block::{MAX_BLOCK_HEIGHT, MAX_BLOCK_HEIGHT_USIZE};
 /// assert_eq!(timelock_to_u64(Timelock::None), 0);
 /// assert_eq!(timelock_to_u64(Timelock::Block(MAX_BLOCK_HEIGHT_USIZE-1)), MAX_BLOCK_HEIGHT-1);

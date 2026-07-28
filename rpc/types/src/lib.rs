@@ -5,10 +5,15 @@
     reason = "macros (internal + serde) make this lint hard to satisfy"
 )]
 
+#[cfg(feature = "__not_public_32_bit")]
+use getrandom as _;
+
 mod constants;
 #[cfg(any(feature = "serde", feature = "epee"))]
 mod defaults;
 mod free;
+#[cfg(feature = "from")]
+mod from;
 mod macros;
 mod rpc_call;
 
@@ -22,7 +27,7 @@ pub mod misc;
 pub mod other;
 
 pub use constants::{
-    CORE_RPC_STATUS_BUSY, CORE_RPC_STATUS_NOT_MINING, CORE_RPC_STATUS_OK,
+    CORE_RPC_STATUS_BUSY, CORE_RPC_STATUS_FAILED, CORE_RPC_STATUS_NOT_MINING, CORE_RPC_STATUS_OK,
     CORE_RPC_STATUS_PAYMENT_REQUIRED, CORE_RPC_VERSION, CORE_RPC_VERSION_MAJOR,
     CORE_RPC_VERSION_MINOR,
 };

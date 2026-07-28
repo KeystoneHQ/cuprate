@@ -1,14 +1,15 @@
 //! Binary route functions.
 
 //---------------------------------------------------------------------------------------------------- Import
-use axum::{body::Bytes, extract::State, http::StatusCode};
+use axum::{body::Bytes, extract::State, http::StatusCode, Json};
+use serde::{Deserialize, Serialize};
 use tower::ServiceExt;
 
 use cuprate_epee_encoding::from_bytes;
 use cuprate_rpc_types::{
     bin::{
         BinRequest, BinResponse, GetBlocksByHeightRequest, GetBlocksRequest, GetHashesRequest,
-        GetOutputIndexesRequest, GetOutsRequest, GetTransactionPoolHashesRequest,
+        GetOutputIndexesRequest, GetOutsRequest,
     },
     json::GetOutputDistributionRequest,
     RpcCall,
@@ -43,27 +44,6 @@ macro_rules! generate_endpoints_with_input {
     }};
 }
 
-/// This macro generates route functions that expect _no_ input.
-///
-/// See below for usage.
-macro_rules! generate_endpoints_with_no_input {
-    ($(
-        // Syntax:
-        // Function name => Expected input type (that is empty)
-        $endpoint:ident => $variant:ident
-    ),*) => { paste::paste! {
-        $(
-            /// TODO
-            pub(crate) async fn $endpoint<H: RpcHandler>(
-                State(handler): State<H>,
-            ) -> Result<Bytes, StatusCode> {
-                const REQUEST: BinRequest = BinRequest::$variant([<$variant Request>] {});
-                generate_endpoints_inner!($variant, handler, REQUEST)
-            }
-        )*
-    }};
-}
-
 /// De-duplicated inner function body for:
 /// - [`generate_endpoints_with_input`]
 /// - [`generate_endpoints_with_no_input`]
@@ -72,7 +52,13 @@ macro_rules! generate_endpoints_inner {
         paste::paste! {
             {
                 // Check if restricted.
-                if [<$variant Request>]::IS_RESTRICTED && $handler.restricted() {
+                //
+                // INVARIANT:
+                // The RPC handler functions in `cuprated` depend on this line existing,
+                // the functions themselves do not check if they are being called
+                // from an (un)restricted context. This line must be here or all
+                // methods will be allowed to be called freely.
+                if [<$variant Request>]::IS_RESTRICTED && $handler.is_restricted() {
                     // TODO: mimic `monerod` behavior.
                     return Err(StatusCode::FORBIDDEN);
                 }
@@ -105,12 +91,23 @@ generate_endpoints_with_input! {
     get_output_distribution => GetOutputDistribution
 }
 
-generate_endpoints_with_no_input! {
-    get_transaction_pool_hashes => GetTransactionPoolHashes
-}
+/// A JSON serde helper that serializes to empty brackets `{}`.
+#[expect(clippy::empty_structs_with_brackets)]
+#[derive(Serialize, Deserialize)]
+pub(crate) struct Null {}
 
-//---------------------------------------------------------------------------------------------------- Tests
-#[cfg(test)]
-mod test {
-    // use super::*;
+/// The handler for the JSON get tx pool hashes, which uses invalid JSON so cannot be deserialized and handled properly.
+pub(crate) async fn get_transaction_pool_hashes<H: RpcHandler>(
+    State(_): State<H>,
+    Json(Null {}): Json<Null>,
+) -> Result<String, StatusCode> {
+    Ok(r#"
+       {
+        "credits": 0,
+        "status": "OK",
+        "top_hash": "",
+        "untrusted": false
+        }
+    "#
+    .to_string())
 }

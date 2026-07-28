@@ -61,7 +61,7 @@ however some fields contain binary values inside JSON strings, for example:
 `binary` here is (de)serialized as a normal [`String`]. In order to be clear on which fields contain binary data, the struct fields that have them will use [`crate::misc::BinaryString`] instead of [`String`].
 
 These mixed types are:
-- [`crate::json::GetTransactionPoolBacklogResponse`]
+- [`crate::json::GetTxpoolBacklogResponse`]
 - [`crate::json::GetOutputDistributionResponse`]
 
 TODO: we need to figure out a type that (de)serializes correctly, `String` errors with `serde_json`
@@ -105,9 +105,10 @@ For `enum`s that encapsulate all request/response types, see:
 # Feature flags
 List of feature flags for `cuprate-rpc-types`.
 
-All are enabled by default.
+Enabled by default: `serde`, `epee`.
 
 | Feature flag | Does what |
 |--------------|-----------|
 | `serde`      | Implements `serde` on all types
 | `epee`       | Implements `cuprate_epee_encoding` on all types
+| `from`       | Implements [`From`] on multiple duplicate types throughout the Cuprate codebase

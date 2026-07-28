@@ -34,6 +34,7 @@ pub use common::{BasicNodeData, CoreSyncData, PeerListEntryBase};
 use protocol::*;
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum LevinCommand {
     Handshake,
     TimedSync,
@@ -223,7 +224,10 @@ impl ProtocolMessage {
                 decode_message(ProtocolMessage::FluffyMissingTransactionsRequest, buf)?
             }
             C::GetTxPoolCompliment => decode_message(ProtocolMessage::GetTxPoolCompliment, buf)?,
-            _ => return Err(BucketError::UnknownCommand),
+
+            C::Handshake | C::TimedSync | C::Ping | C::SupportFlags | C::Unknown(_) => {
+                return Err(BucketError::UnknownCommand);
+            }
         })
     }
 
@@ -295,7 +299,17 @@ impl AdminRequestMessage {
 
                 Self::SupportFlags
             }
-            _ => return Err(BucketError::UnknownCommand),
+
+            C::NewBlock
+            | C::NewTransactions
+            | C::GetObjectsRequest
+            | C::GetObjectsResponse
+            | C::ChainRequest
+            | C::ChainResponse
+            | C::NewFluffyBlock
+            | C::FluffyMissingTxsRequest
+            | C::GetTxPoolCompliment
+            | C::Unknown(_) => return Err(BucketError::UnknownCommand),
         })
     }
 
@@ -342,7 +356,17 @@ impl AdminResponseMessage {
             C::TimedSync => decode_message(AdminResponseMessage::TimedSync, buf)?,
             C::Ping => decode_message(AdminResponseMessage::Ping, buf)?,
             C::SupportFlags => decode_message(AdminResponseMessage::SupportFlags, buf)?,
-            _ => return Err(BucketError::UnknownCommand),
+
+            C::NewBlock
+            | C::NewTransactions
+            | C::GetObjectsRequest
+            | C::GetObjectsResponse
+            | C::ChainRequest
+            | C::ChainResponse
+            | C::NewFluffyBlock
+            | C::FluffyMissingTxsRequest
+            | C::GetTxPoolCompliment
+            | C::Unknown(_) => return Err(BucketError::UnknownCommand),
         })
     }
 
@@ -395,10 +419,10 @@ impl LevinBody for Message {
 
     fn decode_message<B: Buf>(
         body: &mut B,
-        typ: MessageType,
+        ty: MessageType,
         command: LevinCommand,
     ) -> Result<Self, BucketError> {
-        Ok(match typ {
+        Ok(match ty {
             MessageType::Request => Self::Request(AdminRequestMessage::decode(body, command)?),
             MessageType::Response => Self::Response(AdminResponseMessage::decode(body, command)?),
             MessageType::Notification => Self::Protocol(ProtocolMessage::decode(body, command)?),

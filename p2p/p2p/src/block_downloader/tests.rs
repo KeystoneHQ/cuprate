@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     fmt::{Debug, Formatter},
     future::Future,
     pin::Pin,
@@ -9,7 +10,7 @@ use std::{
 
 use futures::{FutureExt, StreamExt};
 use indexmap::IndexMap;
-use monero_serai::{
+use monero_oxide::{
     block::{Block, BlockHeader},
     transaction::{Input, Timelock, Transaction, TransactionPrefix},
 };
@@ -25,8 +26,9 @@ use cuprate_p2p_core::{
 use cuprate_pruning::PruningSeed;
 use cuprate_types::{BlockCompleteEntry, TransactionBlobs};
 use cuprate_wire::{
+    common::PeerSupportFlags,
     protocol::{ChainResponse, GetObjectsResponse},
-    CoreSyncData,
+    BasicNodeData, CoreSyncData,
 };
 
 use crate::{
@@ -43,7 +45,7 @@ proptest! {
     })]
 
     #[test]
-    fn test_block_downloader(blockchain in dummy_blockchain_stragtegy(), peers in 1_usize..128) {
+    fn test_block_downloader(blockchain in dummy_blockchain_strategy(), peers in 1_usize..128) {
         let blockchain = Arc::new(blockchain);
 
         let tokio_pool = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
@@ -87,7 +89,7 @@ proptest! {
 
 prop_compose! {
     /// Returns a strategy to generate a [`Transaction`] that is valid for the block downloader.
-    fn dummy_transaction_stragtegy(height: usize)
+    fn dummy_transaction_strategy(height: usize)
         (
             extra in vec(any::<u8>(), 0..1_000),
             timelock in 1_usize..50_000_000,
@@ -107,18 +109,18 @@ prop_compose! {
 
 prop_compose! {
     /// Returns a strategy to generate a [`Block`] that is valid for the block downloader.
-    fn dummy_block_stragtegy(
+    fn dummy_block_strategy(
             height: usize,
             previous: [u8; 32],
         )
         (
-            miner_transaction in dummy_transaction_stragtegy(height),
-            txs in vec(dummy_transaction_stragtegy(height), 0..25)
+            miner_transaction in dummy_transaction_strategy(height),
+            txs in vec(dummy_transaction_strategy(height), 0..25)
         )
     -> (Block, Vec<Transaction>) {
        (
-           Block {
-                header: BlockHeader {
+           Block::new(
+                 BlockHeader {
                     hardfork_version: 0,
                     hardfork_signal: 0,
                     timestamp: 0,
@@ -126,8 +128,8 @@ prop_compose! {
                     nonce: 0,
                 },
                 miner_transaction,
-                transactions: txs.iter().map(Transaction::hash).collect(),
-           },
+                 txs.iter().map(Transaction::hash).collect(),
+           ).unwrap(),
            txs
        )
     }
@@ -146,15 +148,17 @@ impl Debug for MockBlockchain {
 
 prop_compose! {
     /// Returns a strategy to generate a [`MockBlockchain`].
-    fn dummy_blockchain_stragtegy()(
-        blocks in vec(dummy_block_stragtegy(0, [0; 32]), 1..50_000),
+    fn dummy_blockchain_strategy()(
+        blocks in vec(dummy_block_strategy(0, [0; 32]), 1..50_000),
     ) -> MockBlockchain {
         let mut blockchain = IndexMap::new();
 
         for (height, mut block) in  blocks.into_iter().enumerate() {
             if let Some(last) = blockchain.last() {
                 block.0.header.previous = *last.0;
-                block.0.miner_transaction.prefix_mut().inputs = vec![Input::Gen(height)];
+                let mut miner_transactions = block.0.miner_transaction().clone();
+                miner_transactions.prefix_mut().inputs = vec![Input::Gen(height)];
+                block.0 = Block::new(block.0.header, miner_transactions, block.0.transactions ).unwrap();
             }
 
             blockchain.insert(block.0.hash(), block);
@@ -241,7 +245,7 @@ fn mock_block_downloader_client(blockchain: Arc<MockBlockchain>) -> Client<Clear
                         },
                     )))
                 }
-                _ => panic!(),
+                PeerRequest::Admin(_) | PeerRequest::Protocol(_) => panic!(),
             }
         }
         .boxed()
@@ -249,6 +253,14 @@ fn mock_block_downloader_client(blockchain: Arc<MockBlockchain>) -> Client<Clear
 
     let info = PeerInformation {
         id: InternalPeerID::Unknown(rand::random()),
+        basic_node_data: BasicNodeData {
+            my_port: 0,
+            network_id: [0; 16],
+            peer_id: 0,
+            support_flags: PeerSupportFlags::FLUFFY_BLOCKS,
+            rpc_port: 0,
+            rpc_credits_per_hash: 0,
+        },
         handle: connection_handle,
         direction: ConnectionDirection::Inbound,
         pruning_seed: PruningSeed::NotPruned,
@@ -269,8 +281,8 @@ struct OurChainSvc {
     genesis: [u8; 32],
 }
 
-impl Service<ChainSvcRequest> for OurChainSvc {
-    type Response = ChainSvcResponse;
+impl Service<ChainSvcRequest<ClearNet>> for OurChainSvc {
+    type Response = ChainSvcResponse<ClearNet>;
     type Error = tower::BoxError;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
@@ -279,7 +291,7 @@ impl Service<ChainSvcRequest> for OurChainSvc {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, req: ChainSvcRequest) -> Self::Future {
+    fn call(&mut self, req: ChainSvcRequest<ClearNet>) -> Self::Future {
         let genesis = self.genesis;
 
         async move {
@@ -292,6 +304,10 @@ impl Service<ChainSvcRequest> for OurChainSvc {
                     ChainSvcResponse::FindFirstUnknown(Some((1, 1)))
                 }
                 ChainSvcRequest::CumulativeDifficulty => ChainSvcResponse::CumulativeDifficulty(1),
+                ChainSvcRequest::ValidateEntries(valid, _) => ChainSvcResponse::ValidateEntries {
+                    valid,
+                    unknown: VecDeque::new(),
+                },
             })
         }
         .boxed()

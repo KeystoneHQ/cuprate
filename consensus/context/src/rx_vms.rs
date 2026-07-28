@@ -1,6 +1,6 @@
-//! `RandomX` VM Cache
+//! RandomX VM Cache
 //!
-//! This module keeps track of the `RandomX` VM to calculate the next blocks proof-of-work, if the block needs a randomX VM and potentially
+//! This module keeps track of the RandomX VM to calculate the next blocks proof-of-work, if the block needs a randomX VM and potentially
 //! more VMs around this height.
 //!
 use std::{
@@ -34,11 +34,11 @@ pub const RX_SEEDS_CACHED: usize = 2;
 /// A multithreaded randomX VM.
 #[derive(Debug)]
 pub struct RandomXVm {
-    /// These `RandomX` VMs all share the same cache.
+    /// These RandomX VMs all share the same cache.
     vms: ThreadLocal<VmInner>,
-    /// The `RandomX` cache.
+    /// The RandomX cache.
     cache: RandomXCache,
-    /// The flags used to start the `RandomX` VMs.
+    /// The flags used to start the RandomX VMs.
     flags: RandomXFlag,
 }
 
@@ -161,7 +161,7 @@ impl RandomXVmCache {
         Ok(alt_vm)
     }
 
-    /// Get the main-chain `RandomX` VMs.
+    /// Get the main-chain RandomX VMs.
     pub async fn get_vms(&mut self) -> HashMap<usize, Arc<RandomXVm>> {
         match self.seeds.len().checked_sub(self.vms.len()) {
             // No difference in the amount of seeds to VMs.
@@ -182,7 +182,7 @@ impl RandomXVmCache {
                             tracing::debug!("VM was already created.");
                             break 'new_vm_block cached_vm;
                         }
-                    };
+                    }
 
                     rayon_spawn_async(move || Arc::new(RandomXVm::new(&next_seed_hash).unwrap()))
                         .await
@@ -213,10 +213,26 @@ impl RandomXVmCache {
         self.vms.clone()
     }
 
-    /// Removes all the `RandomX` VMs above the `new_height`.
-    pub fn pop_blocks_main_chain(&mut self, new_height: usize) {
+    /// Removes all the RandomX VMs above the `new_height`.
+    pub async fn pop_blocks_main_chain<D: Database + Clone>(
+        &mut self,
+        new_height: usize,
+        database: D,
+    ) -> Result<(), ContextCacheError> {
         self.seeds.retain(|(height, _)| *height < new_height);
         self.vms.retain(|height, _| *height < new_height);
+
+        if self.seeds.len() < RX_SEEDS_CACHED {
+            let seed_heights = get_last_rx_seed_heights(new_height, RX_SEEDS_CACHED)
+                .split_at(self.seeds.len())
+                .1
+                .to_vec();
+            let seed_hashes = get_block_hashes(seed_heights.clone(), database).await?;
+
+            self.seeds.extend(seed_heights.into_iter().zip(seed_hashes));
+        }
+
+        Ok(())
     }
 
     /// Add a new block to the VM cache.

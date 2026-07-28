@@ -2,66 +2,98 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use cuprate_database::config::SyncMode;
-use cuprate_database_service::ReaderThreads;
+use cuprate_blockchain::config::CacheSizes;
 use cuprate_helper::fs::CUPRATE_DATA_DIR;
 
-/// The storage config.
-#[derive(Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct StorageConfig {
-    /// The amount of reader threads to spawn between the tx-pool and blockchain.
-    pub reader_threads: ReaderThreads,
-    /// The tx-pool config.
-    pub txpool: TxpoolConfig,
-    /// The blockchain config.
-    pub blockchain: BlockchainConfig,
+use super::{default::DefaultOrCustom, macros::config_struct};
+
+config_struct! {
+    /// The storage config.
+    #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields, default)]
+    pub struct StorageConfig {
+        #[comment_out = true]
+        /// The amount of reader threads to spawn for the tx-pool and blockchain.
+        ///
+        /// The tx-pool and blockchain both share a single threadpool.
+        ///
+        /// Type         | Number
+        /// Valid values | >= 0
+        /// Examples     | 1, 16, 10
+        pub reader_threads: usize,
+
+        #[comment_out = true]
+        /// The size of the fjall read cache.
+        ///
+        /// Fjall recommends using 20 to 25 % of available memory.
+        ///
+        /// Type         | Number
+        /// Valid values | >= 0
+        /// Examples     | 64_000_000
+        pub fjall_cache_size: DefaultOrCustom<u64>,
+
+        #[child = true]
+        /// The tx-pool config.
+        pub txpool: TxpoolConfig,
+
+        #[child = true]
+        /// The blockchain config.
+        pub blockchain: BlockchainConfig,
+    }
 }
 
-/// The blockchain config.
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct BlockchainConfig {
-    #[serde(flatten)]
-    pub shared: SharedStorageConfig,
-}
-
-impl Default for BlockchainConfig {
+impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            shared: SharedStorageConfig {
-                sync_mode: SyncMode::Async,
-            },
+            reader_threads: cuprate_helper::thread::threads().get() * 4,
+            fjall_cache_size: DefaultOrCustom::Default,
+            txpool: Default::default(),
+            blockchain: Default::default(),
         }
     }
 }
 
-/// The tx-pool config.
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct TxpoolConfig {
-    #[serde(flatten)]
-    pub shared: SharedStorageConfig,
+config_struct! {
+    /// The tx-pool config.
+    #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields, default)]
+    pub struct TxpoolConfig {
+        /// The maximum size of the tx-pool.
+        ///
+        /// Type         | Number
+        /// Valid values | >= 0
+        /// Examples     | 100_000_000, 50_000_000
+        pub max_txpool_byte_size: usize,
 
-    /// The maximum size of the tx-pool.
-    pub max_txpool_byte_size: usize,
+        /// The maximum age of transactions in the pool in seconds.
+        /// Transactions will be dropped after this time is reached.
+        ///
+        /// Type         | Number
+        /// Valid values | >= 0
+        /// Examples     | 100_000_000, 50_000_000
+        pub maximum_age_secs: u64,
+    }
+}
+
+config_struct! {
+    /// The blockchain config.
+    #[derive(Default, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields, default)]
+    pub struct BlockchainConfig {
+        #[inline = true]
+        #[comment_out = true]
+        /// The size of each tape cache.
+        ///
+        /// You probably do not need to edit these values.
+        pub tapes_cache_sizes: CacheSizes,
+    }
 }
 
 impl Default for TxpoolConfig {
     fn default() -> Self {
         Self {
-            shared: SharedStorageConfig {
-                sync_mode: SyncMode::Async,
-            },
             max_txpool_byte_size: 100_000_000,
+            maximum_age_secs: 60 * 60 * 24,
         }
     }
-}
-
-/// Config values shared between the tx-pool and blockchain.
-#[derive(Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct SharedStorageConfig {
-    /// The [`SyncMode`] of the database.
-    pub sync_mode: SyncMode,
 }

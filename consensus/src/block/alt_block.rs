@@ -4,7 +4,7 @@
 //! difficulty of the alt chain so callers will know if they should re-org to the alt chain.
 use std::{collections::HashMap, sync::Arc};
 
-use monero_serai::{block::Block, transaction::Input};
+use monero_oxide::{block::Block, transaction::Input};
 use tower::{Service, ServiceExt};
 
 use cuprate_consensus_context::{
@@ -29,7 +29,6 @@ use cuprate_types::{
 use crate::{
     block::{free::pull_ordered_transactions, PreparedBlock},
     BlockChainContextRequest, BlockChainContextResponse, ExtendedConsensusError,
-    VerifyBlockResponse,
 };
 
 /// This function sanity checks an alt-block.
@@ -37,11 +36,11 @@ use crate::{
 /// Returns [`AltBlockInformation`], which contains the cumulative difficulty of the alt chain.
 ///
 /// This function only checks the block's proof-of-work and its weight.
-pub(crate) async fn sanity_check_alt_block<C>(
+pub async fn sanity_check_alt_block<C>(
     block: Block,
     txs: HashMap<[u8; 32], TransactionVerificationData>,
     mut context_svc: C,
-) -> Result<VerifyBlockResponse, ExtendedConsensusError>
+) -> Result<AltBlockInformation, ExtendedConsensusError>
 where
     C: Service<
             BlockChainContextRequest,
@@ -65,7 +64,7 @@ where
     };
 
     // Check if the block's miner input is formed correctly.
-    let [Input::Gen(height)] = &block.miner_transaction.prefix().inputs[..] else {
+    let [Input::Gen(height)] = &block.miner_transaction().prefix().inputs[..] else {
         return Err(ConsensusError::Block(BlockError::MinerTxError(
             MinerTxError::InputNotOfTypeGen,
         ))
@@ -102,11 +101,11 @@ where
     .await?;
 
     // Check the alt block timestamp is in the correct range.
-    if let Some(median_timestamp) =
-        difficulty_cache.median_timestamp(u64_to_usize(BLOCKCHAIN_TIMESTAMP_CHECK_WINDOW))
-    {
-        check_timestamp(&prepped_block.block, median_timestamp).map_err(ConsensusError::Block)?;
-    };
+    //
+    // Unlike monerod we also check the future time limit.
+    let median_timestamp =
+        difficulty_cache.median_timestamp(u64_to_usize(BLOCKCHAIN_TIMESTAMP_CHECK_WINDOW));
+    check_timestamp(&prepped_block.block, median_timestamp).map_err(ConsensusError::Block)?;
 
     let next_difficulty = difficulty_cache.next_difficulty(prepped_block.hf_version);
     // make sure the block's PoW is valid for this difficulty.
@@ -151,12 +150,19 @@ where
         block_blob: prepped_block.block_blob,
         txs: ordered_txs
             .into_iter()
-            .map(|tx| VerifiedTransactionInformation {
-                tx_blob: tx.tx_blob,
-                tx_weight: tx.tx_weight,
-                fee: tx.fee,
-                tx_hash: tx.tx_hash,
-                tx: tx.tx,
+            .map(|tx| {
+                let tx_weight = tx.tx_weight;
+                let fee = tx.fee;
+                let tx_hash = tx.tx_hash;
+                let (tx, tx_prunable_blob) = tx.tx.pruned_with_prunable();
+                VerifiedTransactionInformation {
+                    tx_prunable_blob,
+                    tx_pruned: tx.serialize(),
+                    tx_weight,
+                    fee,
+                    tx_hash,
+                    tx,
+                }
             })
             .collect(),
         pow_hash: prepped_block.pow_hash,
@@ -174,18 +180,18 @@ where
         block_info.weight,
         block_info.long_term_weight,
         block_info.block.header.timestamp,
+        cumulative_difficulty,
     );
 
     // Add this alt cache back to the context service.
     context_svc
         .oneshot(BlockChainContextRequest::AddAltChainContextCache {
-            prev_id: block_info.block.header.previous,
             cache: alt_context_cache,
             _token: AltChainRequestToken,
         })
         .await?;
 
-    Ok(VerifyBlockResponse::AltChain(block_info))
+    Ok(block_info)
 }
 
 /// Retrieves the alt RX VM for the chosen block height.

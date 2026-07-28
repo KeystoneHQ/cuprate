@@ -1,9 +1,9 @@
 //! HTTP RPC client.
 
 //---------------------------------------------------------------------------------------------------- Use
-use monero_rpc::Rpc;
-use monero_serai::block::Block;
-use monero_simple_request_rpc::SimpleRequestRpc;
+use monero_daemon_rpc::{prelude::ProvidesTransactions, MoneroDaemon};
+use monero_oxide::block::Block;
+use monero_simple_request_rpc::SimpleRequestTransport;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::task::spawn_blocking;
@@ -19,7 +19,7 @@ pub const LOCALHOST_RPC_URL: &str = "http://127.0.0.1:18081";
 /// An HTTP RPC client for Monero.
 pub struct HttpRpcClient {
     address: String,
-    rpc: SimpleRequestRpc,
+    rpc: MoneroDaemon<SimpleRequestTransport>,
 }
 
 impl HttpRpcClient {
@@ -39,7 +39,7 @@ impl HttpRpcClient {
         let address = address.unwrap_or_else(|| LOCALHOST_RPC_URL.to_string());
 
         Self {
-            rpc: SimpleRequestRpc::new(address.clone()).await.unwrap(),
+            rpc: SimpleRequestTransport::new(address.clone()).await.unwrap(),
             address,
         }
     }
@@ -52,7 +52,7 @@ impl HttpRpcClient {
 
     /// Access to the inner RPC client for other usage.
     #[expect(dead_code)]
-    const fn rpc(&self) -> &SimpleRequestRpc {
+    const fn rpc(&self) -> &MoneroDaemon<SimpleRequestTransport> {
         &self.rpc
     }
 
@@ -81,22 +81,28 @@ impl HttpRpcClient {
 
         let result = self
             .rpc
-            .json_rpc_call::<Result>(
+            .json_rpc_call(
                 "get_block",
-                Some(json!(
-                    {
-                        "height": height,
-                        "fill_pow_hash": true
-                    }
-                )),
+                Some(
+                    json!(
+                        {
+                            "height": height,
+                            "fill_pow_hash": true
+                        }
+                    )
+                    .to_string(),
+                ),
+                usize::MAX,
             )
             .await
             .unwrap();
 
+        let result: Result = serde_json::from_str(&result).unwrap();
+
         // Make sure this is a trusted, `pow_hash` only works there.
         assert!(
-        	!result.block_header.pow_hash.is_empty(),
-        	"untrusted node detected, `pow_hash` will not show on these nodes - use a trusted node!"
+            !result.block_header.pow_hash.is_empty(),
+            "untrusted node detected, `pow_hash` will not show on these nodes - use a trusted node!"
         );
 
         let reward = result.block_header.reward;
@@ -123,7 +129,7 @@ impl HttpRpcClient {
 
         let total_tx_fees = txs.iter().map(|tx| tx.fee).sum::<u64>();
         let generated_coins = block
-            .miner_transaction
+            .miner_transaction()
             .prefix()
             .outputs
             .iter()
@@ -160,7 +166,7 @@ impl HttpRpcClient {
         tx_hashes: &'a [[u8; 32]],
     ) -> impl Iterator<Item = VerifiedTransactionInformation> + 'a {
         self.rpc
-            .get_transactions(tx_hashes)
+            .transactions(tx_hashes)
             .await
             .unwrap()
             .into_iter()
@@ -168,12 +174,17 @@ impl HttpRpcClient {
             .map(|(i, tx)| {
                 let tx_hash = tx.hash();
                 assert_eq!(tx_hash, tx_hashes[i]);
+                let tx_weight = tx.weight();
+                let fee = tx_fee(&tx);
+                let (tx_pruned, prunable) = tx.pruned_with_prunable();
+
                 VerifiedTransactionInformation {
-                    tx_blob: tx.serialize(),
-                    tx_weight: tx.weight(),
+                    tx_weight,
+                    tx_pruned: tx_pruned.serialize(),
+                    tx_prunable_blob: prunable,
                     tx_hash,
-                    fee: tx_fee(&tx),
-                    tx,
+                    fee,
+                    tx: tx_pruned,
                 }
             })
     }
@@ -187,6 +198,7 @@ mod tests {
     use super::*;
 
     /// Assert the default address is localhost.
+    #[ignore] // FIXME: doesn't work in CI, we need a real unrestricted node
     #[tokio::test]
     async fn localhost() {
         assert_eq!(HttpRpcClient::new(None).await.address(), LOCALHOST_RPC_URL);

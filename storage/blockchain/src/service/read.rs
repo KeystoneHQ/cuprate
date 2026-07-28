@@ -1,85 +1,103 @@
 //! Database reader thread-pool definitions and logic.
 
-#![expect(
-    unreachable_code,
-    unused_variables,
-    clippy::unnecessary_wraps,
-    clippy::needless_pass_by_value,
-    reason = "TODO: finish implementing the signatures from <https://github.com/Cuprate/cuprate/pull/297>"
-)]
-
 //---------------------------------------------------------------------------------------------------- Import
 use std::{
     cmp::min,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
+    ops::Range,
     sync::Arc,
+    task::{Context, Poll},
 };
 
+use bytes::Bytes;
+use fjall::Readable;
+use futures::channel::oneshot;
+use indexmap::{IndexMap, IndexSet};
 use rayon::{
     iter::{Either, IntoParallelIterator, ParallelIterator},
     prelude::*,
     ThreadPool,
 };
-use thread_local::ThreadLocal;
+use tapes::TapesRead;
+use tower::Service;
 
-use cuprate_database::{ConcreteEnv, DatabaseRo, DbResult, Env, EnvInner, RuntimeError};
-use cuprate_database_service::{init_thread_pool, DatabaseReadService, ReaderThreads};
-use cuprate_helper::map::combine_low_high_bits_to_u128;
+use cuprate_helper::{
+    asynch::InfallibleOneshotReceiver,
+    cast::{u64_to_usize, usize_to_u64},
+    map::{combine_low_high_bits_to_u128, split_u128_into_low_high_bits},
+};
 use cuprate_types::{
     blockchain::{BlockchainReadRequest, BlockchainResponse},
-    Chain, ChainId, ExtendedBlockHeader, OutputHistogramInput, OutputOnChain, TxsInBlock,
+    output_cache::OutputCache,
+    rpc::{
+        ChainInfo, CoinbaseTxSum, OutputDistributionData, OutputHistogramEntry,
+        OutputHistogramInput,
+    },
+    Chain, ChainId, ExtendedBlockHeader, PreRctOutputDistributionInput, TransactionBlobs,
+    TxInBlockchain, TxsInBlock,
 };
 
 use crate::{
+    error::{BlockchainError, DbResult},
     ops::{
         alt_block::{
-            get_alt_block, get_alt_block_extended_header_from_height, get_alt_block_hash,
-            get_alt_chain_history_ranges,
+            alt_block_height, get_alt_block, get_alt_block_extended_header_from_height,
+            get_alt_block_hash, get_alt_block_information, get_alt_chain_history_ranges,
         },
         block::{
-            block_exists, get_block_blob_with_tx_indexes, get_block_complete_entry,
-            get_block_extended_header_from_height, get_block_height, get_block_info,
+            block_exists, block_height, get_block, get_block_by_hash, get_block_complete_entry,
+            get_block_complete_entry_from_height, get_block_extended_header_from_height,
         },
-        blockchain::{cumulative_generated_coins, find_split_point, top_block_height},
-        key_image::key_image_exists,
-        output::id_to_output_on_chain,
+        blockchain::find_split_point,
+        output::{
+            get_num_outputs_with_amount, id_to_output_on_chain, unlocked_and_recent_instances,
+        },
+        tx::{get_split_tx_blobs, get_tx_blob_from_id},
     },
     service::{
         free::{compact_history_genesis_not_included, compact_history_index_to_height_offset},
-        types::{BlockchainReadHandle, ResponseResult},
+        ResponseResult,
     },
-    tables::{AltBlockHeights, BlockHeights, BlockInfos, OpenTables, Tables, TablesIter},
     types::{
-        AltBlockHeight, Amount, AmountIndex, BlockHash, BlockHeight, KeyImage, PreRctOutputId,
+        AltBlockHeight, AltChainInfo, Amount, AmountIndex, BlockHash, BlockHeight,
+        CompactAltBlockInfo, KeyImage, Output, PreRctOutputId, RawChainId,
     },
+    BlockchainDatabase,
 };
 
-//---------------------------------------------------------------------------------------------------- init_read_service
-/// Initialize the [`BlockchainReadHandle`] thread-pool backed by [`rayon`].
-///
-/// This spawns `threads` amount of reader threads
-/// attached to `env` and returns a handle to the pool.
-///
-/// Should be called _once_ per actual database. Calling this function more than once will create
-/// multiple unnecessary rayon thread-pools.
-#[cold]
-#[inline(never)] // Only called once.
-pub fn init_read_service(env: Arc<ConcreteEnv>, threads: ReaderThreads) -> BlockchainReadHandle {
-    init_read_service_with_pool(env, init_thread_pool(threads))
+/// The [`tower::Service`] handle to read from the database.
+#[derive(Clone)]
+pub struct BlockchainReadHandle {
+    /// Handle to the custom `rayon` DB reader thread-pool.
+    ///
+    /// Requests are [`rayon::ThreadPool::spawn`]ed in this thread-pool,
+    /// and responses are returned via a channel we (the caller) provide.
+    pub pool: Arc<ThreadPool>,
+
+    pub blockchain: Arc<BlockchainDatabase>,
 }
 
-/// Initialize the blockchain database read service, with a specific rayon thread-pool instead of
-/// creating a new one.
-///
-/// Should be called _once_ per actual database, although nothing bad will happen, cloning the [`BlockchainReadHandle`]
-/// is the correct way to get multiple handles to the database.
-#[cold]
-#[inline(never)] // Only called once.
-pub fn init_read_service_with_pool(
-    env: Arc<ConcreteEnv>,
-    pool: Arc<ThreadPool>,
-) -> BlockchainReadHandle {
-    DatabaseReadService::new(env, pool, map_request)
+impl Service<BlockchainReadRequest> for BlockchainReadHandle {
+    type Response = BlockchainResponse;
+    type Error = BlockchainError;
+    type Future = InfallibleOneshotReceiver<Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: BlockchainReadRequest) -> Self::Future {
+        let (tx, rx) = oneshot::channel();
+
+        let db = Arc::clone(&self.blockchain);
+        self.pool.spawn(move || {
+            let res = map_request(&db, req);
+
+            let _ = tx.send(res);
+        });
+
+        InfallibleOneshotReceiver::from(rx)
+    }
 }
 
 //---------------------------------------------------------------------------------------------------- Request Mapping
@@ -94,17 +112,33 @@ pub fn init_read_service_with_pool(
 /// 2. Handler function is called
 /// 3. [`BlockchainResponse`] is returned
 fn map_request(
-    env: &ConcreteEnv,              // Access to the database
+    env: &BlockchainDatabase,       // Access to the database
     request: BlockchainReadRequest, // The request we must fulfill
-) -> ResponseResult {
+) -> Result<BlockchainResponse, BlockchainError> {
     use BlockchainReadRequest as R;
 
     /* SOMEDAY: pre-request handling, run some code for each request? */
 
     match request {
         R::BlockCompleteEntries(block_hashes) => block_complete_entries(env, block_hashes),
+        R::BlockCompleteEntriesByHeight(heights) => block_complete_entries_by_height(env, heights),
+        R::BlockCompleteEntriesAboveSplitPoint {
+            chain,
+            start_height,
+            no_miner_tx,
+            len,
+            pruned,
+        } => block_complete_entries_above_split_point(
+            env,
+            &chain,
+            start_height,
+            no_miner_tx,
+            len,
+            pruned,
+        ),
         R::BlockExtendedHeader(block) => block_extended_header(env, block),
         R::BlockHash(block, chain) => block_hash(env, block, chain),
+        R::BlockHashInRange(blocks, chain) => block_hash_in_range(env, blocks, chain),
         R::FindBlock(block_hash) => find_block(env, block_hash),
         R::FilterUnknownHashes(hashes) => filter_unknown_hashes(env, hashes),
         R::BlockExtendedHeaderInRange(range, chain) => {
@@ -112,9 +146,15 @@ fn map_request(
         }
         R::ChainHeight => chain_height(env),
         R::GeneratedCoins(height) => generated_coins(env, height),
-        R::Outputs(map) => outputs(env, map),
+        R::CumulativeRctOutsInRange(range) => cumulative_rct_outs_in_range(env, range),
+        R::Outputs {
+            outputs: map,
+            get_txid,
+        } => outputs(env, map, get_txid),
+        R::OutputsVec { outputs, get_txid } => outputs_vec(env, outputs, get_txid),
         R::NumberOutputsWithAmount(vec) => number_outputs_with_amount(env, vec),
         R::KeyImagesSpent(set) => key_images_spent(env, set),
+        R::KeyImagesSpentVec(set) => key_images_spent_vec(env, set),
         R::CompactChainHistory => compact_chain_history(env),
         R::NextChainEntry(block_hashes, amount) => next_chain_entry(env, &block_hashes, amount),
         R::FindFirstUnknown(block_ids) => find_first_unknown(env, &block_ids),
@@ -125,62 +165,19 @@ fn map_request(
         R::AltBlocksInChain(chain_id) => alt_blocks_in_chain(env, chain_id),
         R::Block { height } => block(env, height),
         R::BlockByHash(hash) => block_by_hash(env, hash),
-        R::TotalTxCount => total_tx_count(env),
-        R::DatabaseSize => database_size(env),
-        R::OutputHistogram(input) => output_histogram(env, input),
+        R::TotalTxCount => Ok(total_tx_count(env)),
+        R::DatabaseSize => Ok(database_size(env)),
+        R::OutputHistogram(input) => output_histogram(env, &input),
         R::CoinbaseTxSum { height, count } => coinbase_tx_sum(env, height, count),
         R::AltChains => alt_chains(env),
         R::AltChainCount => alt_chain_count(env),
+        R::Transactions { tx_hashes } => transactions(env, tx_hashes),
+        R::TotalRctOutputs => Ok(total_rct_outputs(env)),
+        R::TxOutputIndexes { tx_hash } => tx_output_indexes(env, &tx_hash),
+        R::PreRctOutputDistribution(input) => pre_rct_output_distribution(env, &input),
     }
 
     /* SOMEDAY: post-request handling, run some code for each request? */
-}
-
-//---------------------------------------------------------------------------------------------------- Thread Local
-/// Q: Why does this exist?
-///
-/// A1: `heed`'s transactions and tables are not `Sync`, so we cannot use
-/// them with rayon, however, we set a feature such that they are `Send`.
-///
-/// A2: When sending to rayon, we want to ensure each read transaction
-/// is only being used by 1 thread only to scale reads
-///
-/// <https://github.com/Cuprate/cuprate/pull/113#discussion_r1576762346>
-#[inline]
-fn thread_local<T: Send>(env: &impl Env) -> ThreadLocal<T> {
-    ThreadLocal::with_capacity(env.config().reader_threads.get())
-}
-
-/// Take in a `ThreadLocal<impl Tables>` and return an `&impl Tables + Send`.
-///
-/// # Safety
-/// See [`DatabaseRo`] docs.
-///
-/// We are safely using `UnsafeSendable` in `service`'s reader thread-pool
-/// as we are pairing our usage with `ThreadLocal` - only 1 thread
-/// will ever access a transaction at a time. This is an INVARIANT.
-///
-/// A `Mutex` was considered but:
-/// - It is less performant
-/// - It isn't technically needed for safety in our use-case
-/// - It causes `DatabaseIter` function return issues as there is a `MutexGuard` object
-///
-/// <https://github.com/Cuprate/cuprate/pull/113#discussion_r1581684698>
-///
-/// # Notes
-/// This is used for other backends as well instead of branching with `cfg_if`.
-/// The other backends (as of current) are `Send + Sync` so this is fine.
-/// <https://github.com/Cuprate/cuprate/pull/113#discussion_r1585618374>
-macro_rules! get_tables {
-    ($env_inner:ident, $tx_ro:ident, $tables:ident) => {{
-        $tables.get_or_try(|| {
-            match $env_inner.open_tables($tx_ro) {
-                // SAFETY: see above macro doc comment.
-                Ok(tables) => Ok(unsafe { crate::unsafe_sendable::UnsafeSendable::new(tables) }),
-                Err(e) => Err(e),
-            }
-        })
-    }};
 }
 
 //---------------------------------------------------------------------------------------------------- Handler functions
@@ -207,29 +204,21 @@ macro_rules! get_tables {
 // amount of parallelism.
 
 /// [`BlockchainReadRequest::BlockCompleteEntries`].
-fn block_complete_entries(env: &ConcreteEnv, block_hashes: Vec<BlockHash>) -> ResponseResult {
-    // Prepare tx/tables in `ThreadLocal`.
-    let env_inner = env.env_inner();
-    let tx_ro = thread_local(env);
-    let tables = thread_local(env);
+fn block_complete_entries(db: &BlockchainDatabase, block_hashes: Vec<BlockHash>) -> ResponseResult {
+    let tx_ro = db.fjall.snapshot();
+    let tapes = db.linear_tapes.reader();
 
     let (missing_hashes, blocks) = block_hashes
         .into_par_iter()
-        .map(|block_hash| {
-            let tx_ro = tx_ro.get_or_try(|| env_inner.tx_ro())?;
-            let tables = get_tables!(env_inner, tx_ro, tables)?.as_ref();
-
-            match get_block_complete_entry(&block_hash, tables) {
-                Err(RuntimeError::KeyNotFound) => Ok(Either::Left(block_hash)),
+        .map(
+            |block_hash| match get_block_complete_entry(db, &block_hash, false, &tx_ro, &tapes) {
+                Err(BlockchainError::NotFound) => Ok(Either::Left(block_hash)),
                 res => res.map(Either::Right),
-            }
-        })
+            },
+        )
         .collect::<DbResult<_>>()?;
 
-    let tx_ro = tx_ro.get_or_try(|| env_inner.tx_ro())?;
-    let tables = get_tables!(env_inner, tx_ro, tables)?.as_ref();
-
-    let blockchain_height = crate::ops::blockchain::chain_height(tables.block_heights())?;
+    let blockchain_height = crate::ops::blockchain::chain_height(db, &tapes)?;
 
     Ok(BlockchainResponse::BlockCompleteEntries {
         blocks,
@@ -238,84 +227,263 @@ fn block_complete_entries(env: &ConcreteEnv, block_hashes: Vec<BlockHash>) -> Re
     })
 }
 
+/// [`BlockchainReadRequest::BlockCompleteEntriesAboveSplitPoint`].
+fn block_complete_entries_above_split_point(
+    db: &BlockchainDatabase,
+    chain: &[[u8; 32]],
+    start_height: Option<usize>,
+    no_miner_tx: bool,
+    len: usize,
+    pruned: bool,
+) -> ResponseResult {
+    /// Total size of all block/tx blobs to return before stopping early.
+    ///
+    /// This is lower than monerod, as monerod packs too close to the epee size limit.
+    const MAX_TOTAL_SIZE: usize = 50 * 1024 * 1024;
+    /// Total tx count to return before stopping early.
+    ///
+    /// This is lower than monerod, as monerod packs too close to the epee size limit.
+    const MAX_TOTAL_TXS: usize = 10_000;
+
+    let tx_ro = db.fjall.snapshot();
+    let tapes = db.linear_tapes.reader();
+
+    let blockchain_height = crate::ops::blockchain::chain_height(db, &tapes)?;
+    let top_hash = tapes
+        .read_entry(&db.block_infos, usize_to_u64(blockchain_height - 1))?
+        .ok_or(BlockchainError::NotFound)?
+        .block_hash;
+
+    // If a specific start height was requested, use it directly. Otherwise, scan to find the split point.
+    let height = if let Some(h) = start_height {
+        if h >= blockchain_height {
+            return Ok(BlockchainResponse::BlockCompleteEntriesAboveSplitPoint {
+                blocks: vec![],
+                output_indices: vec![],
+                blockchain_height,
+                start_height: h,
+                top_hash,
+            });
+        }
+        h
+    } else {
+        let split = find_split_point(db, chain, false, false, &tx_ro)?;
+
+        if split == chain.len() {
+            return Err(BlockchainError::NotFound);
+        }
+
+        block_height(db, &tx_ro, &chain[split])?.ok_or(BlockchainError::NotFound)?
+    };
+
+    if height == blockchain_height {
+        return Ok(BlockchainResponse::BlockCompleteEntriesAboveSplitPoint {
+            blocks: vec![],
+            output_indices: vec![],
+            blockchain_height,
+            start_height: height,
+            top_hash,
+        });
+    }
+
+    let mut tx_count = 0;
+    let mut total_size = 0;
+
+    let blocks: Vec<_> = (height..min(height + len, blockchain_height))
+        .map_while(|height| {
+            if total_size >= MAX_TOTAL_SIZE || tx_count >= MAX_TOTAL_TXS {
+                return None;
+            }
+
+            let block = match get_block_complete_entry_from_height(height, pruned, &tapes, db) {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+
+            tx_count += block.txs.len() + 1;
+
+            let tx_blobs_size = match &block.txs {
+                TransactionBlobs::None => 0,
+                TransactionBlobs::Normal(b) => b.iter().map(Bytes::len).sum(),
+                TransactionBlobs::Pruned(p) => p.iter().map(|p| p.blob.len() + 32).sum(),
+            };
+
+            total_size += block.block.len() + tx_blobs_size;
+
+            Some(Ok(block))
+        })
+        .collect::<DbResult<_>>()?;
+
+    let first_tx_idx = tapes
+        .read_entry(&db.block_infos, usize_to_u64(height))?
+        .ok_or(BlockchainError::NotFound)?
+        .mining_tx_index;
+
+    let mut output_indices = Vec::with_capacity(blocks.len());
+    output_indices.push(Vec::with_capacity(8));
+
+    let mut last_height = height;
+    let mut miner_tx = true;
+
+    for (i, tx_info) in tapes.iter_from(&db.tx_infos, first_tx_idx)?.enumerate() {
+        let tx_info = tx_info?;
+
+        if tx_info.height != last_height {
+            if tx_info.height == height + blocks.len() {
+                // We have gone past all txs in the blocks we need
+                break;
+            }
+            last_height = tx_info.height;
+            miner_tx = true;
+            output_indices.push(Vec::with_capacity(8));
+        }
+
+        // monerod replaces the miner tx's indices with an empty
+        // placeholder when `no_miner_tx` is set.
+        if no_miner_tx && miner_tx {
+            miner_tx = false;
+            output_indices.last_mut().unwrap().push(vec![]);
+            continue;
+        }
+        miner_tx = false;
+
+        let o_indexes = if tx_info.is_v1_tx() {
+            // For v1 txs we need to look up indexes.
+            let res = tx_ro
+                .get(
+                    &db.v1_tx_outputs,
+                    (first_tx_idx + usize_to_u64(i)).to_le_bytes(),
+                )?
+                .ok_or(BlockchainError::NotFound)?;
+
+            res.chunks(8)
+                .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+                .collect::<Vec<_>>()
+        } else {
+            // For v2 we can use the data in the tx_info.
+            (0..tx_info.numb_rct_outputs)
+                .map(|i| usize_to_u64(i) + tx_info.rct_output_start_idx)
+                .collect()
+        };
+
+        output_indices.last_mut().unwrap().push(o_indexes);
+    }
+
+    Ok(BlockchainResponse::BlockCompleteEntriesAboveSplitPoint {
+        blocks,
+        output_indices,
+        blockchain_height,
+        start_height: height,
+        top_hash,
+    })
+}
+
+/// [`BlockchainReadRequest::BlockCompleteEntriesByHeight`].
+fn block_complete_entries_by_height(
+    db: &BlockchainDatabase,
+    block_heights: Vec<BlockHeight>,
+) -> ResponseResult {
+    let tapes = db.linear_tapes.reader();
+
+    let blocks = block_heights
+        .into_par_iter()
+        .map(|height| get_block_complete_entry_from_height(height, false, &tapes, db))
+        .collect::<DbResult<_>>()?;
+
+    Ok(BlockchainResponse::BlockCompleteEntriesByHeight(blocks))
+}
+
 /// [`BlockchainReadRequest::BlockExtendedHeader`].
 #[inline]
-fn block_extended_header(env: &ConcreteEnv, block_height: BlockHeight) -> ResponseResult {
-    // Single-threaded, no `ThreadLocal` required.
-    let env_inner = env.env_inner();
-    let tx_ro = env_inner.tx_ro()?;
-    let tables = env_inner.open_tables(&tx_ro)?;
+fn block_extended_header(db: &BlockchainDatabase, block_height: BlockHeight) -> ResponseResult {
+    let tapes = db.linear_tapes.reader();
 
     Ok(BlockchainResponse::BlockExtendedHeader(
-        get_block_extended_header_from_height(&block_height, &tables)?,
+        get_block_extended_header_from_height(block_height, &tapes, db)?,
     ))
 }
 
 /// [`BlockchainReadRequest::BlockHash`].
 #[inline]
-fn block_hash(env: &ConcreteEnv, block_height: BlockHeight, chain: Chain) -> ResponseResult {
-    // Single-threaded, no `ThreadLocal` required.
-    let env_inner = env.env_inner();
-    let tx_ro = env_inner.tx_ro()?;
-    let table_block_infos = env_inner.open_db_ro::<BlockInfos>(&tx_ro)?;
+fn block_hash(db: &BlockchainDatabase, block_height: BlockHeight, chain: Chain) -> ResponseResult {
+    let tx_ro = db.fjall.snapshot();
+
+    let tapes = db.linear_tapes.reader();
 
     let block_hash = match chain {
-        Chain::Main => get_block_info(&block_height, &table_block_infos)?.block_hash,
-        Chain::Alt(chain) => {
-            get_alt_block_hash(&block_height, chain, &env_inner.open_tables(&tx_ro)?)?
+        Chain::Main => {
+            tapes
+                .read_entry(&db.block_infos, usize_to_u64(block_height))?
+                .ok_or(BlockchainError::NotFound)?
+                .block_hash
         }
+        Chain::Alt(chain) => get_alt_block_hash(db, &block_height, chain, &tx_ro, &tapes)?,
     };
 
     Ok(BlockchainResponse::BlockHash(block_hash))
 }
 
+/// [`BlockchainReadRequest::BlockHashInRange`].
+#[inline]
+fn block_hash_in_range(
+    db: &BlockchainDatabase,
+    range: Range<usize>,
+    chain: Chain,
+) -> ResponseResult {
+    let tx_ro = db.fjall.snapshot();
+    let tapes = db.linear_tapes.reader();
+
+    if range.is_empty() {
+        return Ok(BlockchainResponse::BlockHashInRange(vec![]));
+    }
+
+    let block_hash = match chain {
+        Chain::Main => tapes
+            .iter_from(&db.block_infos, usize_to_u64(range.start))?
+            .map(|info| Ok(info?.block_hash))
+            .take(range.len())
+            .collect::<Result<_, BlockchainError>>()?,
+        Chain::Alt(chain) => range
+            .into_par_iter()
+            .map(|block_height| get_alt_block_hash(db, &block_height, chain, &tx_ro, &tapes))
+            .collect::<DbResult<Vec<_>>>()?,
+    };
+
+    Ok(BlockchainResponse::BlockHashInRange(block_hash))
+}
+
 /// [`BlockchainReadRequest::FindBlock`]
-fn find_block(env: &ConcreteEnv, block_hash: BlockHash) -> ResponseResult {
-    // Single-threaded, no `ThreadLocal` required.
-    let env_inner = env.env_inner();
-    let tx_ro = env_inner.tx_ro()?;
+fn find_block(db: &BlockchainDatabase, block_hash: BlockHash) -> ResponseResult {
+    let tx_ro = db.fjall.snapshot();
 
-    let table_block_heights = env_inner.open_db_ro::<BlockHeights>(&tx_ro)?;
+    // Check the main chain first, then alt chains.
+    let location = if let Some(height) = block_height(db, &tx_ro, &block_hash)? {
+        Some((Chain::Main, height))
+    } else {
+        alt_block_height(db, &tx_ro, &block_hash)?
+            .map(|alt| (Chain::Alt(alt.chain_id.into()), alt.height))
+    };
 
-    // Check the main chain first.
-    match table_block_heights.get(&block_hash) {
-        Ok(height) => return Ok(BlockchainResponse::FindBlock(Some((Chain::Main, height)))),
-        Err(RuntimeError::KeyNotFound) => (),
-        Err(e) => return Err(e),
-    }
-
-    let table_alt_block_heights = env_inner.open_db_ro::<AltBlockHeights>(&tx_ro)?;
-
-    match table_alt_block_heights.get(&block_hash) {
-        Ok(height) => Ok(BlockchainResponse::FindBlock(Some((
-            Chain::Alt(height.chain_id.into()),
-            height.height,
-        )))),
-        Err(RuntimeError::KeyNotFound) => Ok(BlockchainResponse::FindBlock(None)),
-        Err(e) => Err(e),
-    }
+    Ok(BlockchainResponse::FindBlock(location))
 }
 
 /// [`BlockchainReadRequest::FilterUnknownHashes`].
 #[inline]
-fn filter_unknown_hashes(env: &ConcreteEnv, mut hashes: HashSet<BlockHash>) -> ResponseResult {
-    // Single-threaded, no `ThreadLocal` required.
-    let env_inner = env.env_inner();
-    let tx_ro = env_inner.tx_ro()?;
-
-    let table_block_heights = env_inner.open_db_ro::<BlockHeights>(&tx_ro)?;
+fn filter_unknown_hashes(
+    db: &BlockchainDatabase,
+    mut hashes: HashSet<BlockHash>,
+) -> ResponseResult {
+    let tx_ro = db.fjall.snapshot();
 
     let mut err = None;
 
-    hashes.retain(
-        |block_hash| match block_exists(block_hash, &table_block_heights) {
-            Ok(exists) => exists,
-            Err(e) => {
-                err.get_or_insert(e);
-                false
-            }
-        },
-    );
+    hashes.retain(|block_hash| match block_exists(db, block_hash, &tx_ro) {
+        Ok(exists) => exists,
+        Err(e) => {
+            err.get_or_insert(e);
+            false
+        }
+    });
 
     if let Some(e) = err {
         Err(e)
@@ -327,52 +495,36 @@ fn filter_unknown_hashes(env: &ConcreteEnv, mut hashes: HashSet<BlockHash>) -> R
 /// [`BlockchainReadRequest::BlockExtendedHeaderInRange`].
 #[inline]
 fn block_extended_header_in_range(
-    env: &ConcreteEnv,
-    range: std::ops::Range<BlockHeight>,
+    db: &BlockchainDatabase,
+    range: Range<BlockHeight>,
     chain: Chain,
 ) -> ResponseResult {
-    // Prepare tx/tables in `ThreadLocal`.
-    let env_inner = env.env_inner();
-    let tx_ro = thread_local(env);
-    let tables = thread_local(env);
+    let tx_ro = db.fjall.snapshot();
+    let tapes = db.linear_tapes.reader();
 
     // Collect results using `rayon`.
     let vec = match chain {
         Chain::Main => range
-            .into_par_iter()
-            .map(|block_height| {
-                let tx_ro = tx_ro.get_or_try(|| env_inner.tx_ro())?;
-                let tables = get_tables!(env_inner, tx_ro, tables)?.as_ref();
-                get_block_extended_header_from_height(&block_height, tables)
-            })
+            .into_iter()
+            .map(|block_height| get_block_extended_header_from_height(block_height, &tapes, db))
             .collect::<DbResult<Vec<ExtendedBlockHeader>>>()?,
         Chain::Alt(chain_id) => {
-            let ranges = {
-                let tx_ro = tx_ro.get_or_try(|| env_inner.tx_ro())?;
-                let tables = get_tables!(env_inner, tx_ro, tables)?.as_ref();
-                let alt_chains = tables.alt_chain_infos();
-
-                get_alt_chain_history_ranges(range, chain_id, alt_chains)?
-            };
+            let ranges = { get_alt_chain_history_ranges(db, range, chain_id, &tx_ro)? };
 
             ranges
-                .par_iter()
+                .iter()
                 .rev()
                 .flat_map(|(chain, range)| {
-                    range.clone().into_par_iter().map(|height| {
-                        let tx_ro = tx_ro.get_or_try(|| env_inner.tx_ro())?;
-                        let tables = get_tables!(env_inner, tx_ro, tables)?.as_ref();
-
-                        match *chain {
-                            Chain::Main => get_block_extended_header_from_height(&height, tables),
-                            Chain::Alt(chain_id) => get_alt_block_extended_header_from_height(
-                                &AltBlockHeight {
-                                    chain_id: chain_id.into(),
-                                    height,
-                                },
-                                tables,
-                            ),
-                        }
+                    range.clone().map(|height| match *chain {
+                        Chain::Main => get_block_extended_header_from_height(height, &tapes, db),
+                        Chain::Alt(chain_id) => get_alt_block_extended_header_from_height(
+                            db,
+                            &AltBlockHeight {
+                                chain_id: chain_id.into(),
+                                height,
+                            },
+                            &tx_ro,
+                        ),
                     })
                 })
                 .collect::<DbResult<Vec<_>>>()?
@@ -384,114 +536,176 @@ fn block_extended_header_in_range(
 
 /// [`BlockchainReadRequest::ChainHeight`].
 #[inline]
-fn chain_height(env: &ConcreteEnv) -> ResponseResult {
-    // Single-threaded, no `ThreadLocal` required.
-    let env_inner = env.env_inner();
-    let tx_ro = env_inner.tx_ro()?;
-    let table_block_heights = env_inner.open_db_ro::<BlockHeights>(&tx_ro)?;
-    let table_block_infos = env_inner.open_db_ro::<BlockInfos>(&tx_ro)?;
+fn chain_height(db: &BlockchainDatabase) -> ResponseResult {
+    let tapes = db.linear_tapes.reader();
 
-    let chain_height = crate::ops::blockchain::chain_height(&table_block_heights)?;
-    let block_hash =
-        get_block_info(&chain_height.saturating_sub(1), &table_block_infos)?.block_hash;
+    let chain_height = tapes
+        .fixed_sized_tape_len(&db.block_infos)
+        .expect("Required tape not found");
 
-    Ok(BlockchainResponse::ChainHeight(chain_height, block_hash))
+    if chain_height == 0 {
+        return Err(BlockchainError::NotFound);
+    }
+
+    let block_hash = tapes
+        .read_entry(&db.block_infos, chain_height - 1)?
+        .ok_or(BlockchainError::NotFound)?
+        .block_hash;
+
+    Ok(BlockchainResponse::ChainHeight(
+        chain_height.try_into().unwrap(),
+        block_hash,
+    ))
 }
 
 /// [`BlockchainReadRequest::GeneratedCoins`].
 #[inline]
-fn generated_coins(env: &ConcreteEnv, height: usize) -> ResponseResult {
-    // Single-threaded, no `ThreadLocal` required.
-    let env_inner = env.env_inner();
-    let tx_ro = env_inner.tx_ro()?;
-    let table_block_infos = env_inner.open_db_ro::<BlockInfos>(&tx_ro)?;
+fn generated_coins(db: &BlockchainDatabase, height: usize) -> ResponseResult {
+    let tapes = db.linear_tapes.reader();
 
     Ok(BlockchainResponse::GeneratedCoins(
-        cumulative_generated_coins(&height, &table_block_infos)?,
+        tapes
+            .read_entry(&db.block_infos, usize_to_u64(height))?
+            .map_or(0, |info| info.cumulative_generated_coins),
+    ))
+}
+
+/// [`BlockchainReadRequest::CumulativeRctOutsInRange`].
+#[inline]
+fn cumulative_rct_outs_in_range(db: &BlockchainDatabase, range: Range<usize>) -> ResponseResult {
+    let tapes = db.linear_tapes.reader();
+
+    let cumulative_rct_outs = tapes
+        .iter_from(&db.block_infos, usize_to_u64(range.start))?
+        .take(range.len())
+        .map(|info| Ok(info?.cumulative_rct_outs))
+        .collect::<DbResult<Vec<u64>>>()?;
+
+    if cumulative_rct_outs.len() < range.len() {
+        return Err(BlockchainError::NotFound);
+    }
+
+    Ok(BlockchainResponse::CumulativeRctOutsInRange(
+        cumulative_rct_outs,
     ))
 }
 
 /// [`BlockchainReadRequest::Outputs`].
 #[inline]
-fn outputs(env: &ConcreteEnv, outputs: HashMap<Amount, HashSet<AmountIndex>>) -> ResponseResult {
+fn outputs(
+    db: &BlockchainDatabase,
+    outputs: IndexMap<Amount, IndexSet<AmountIndex>>,
+    get_txid: bool,
+) -> ResponseResult {
     // Prepare tx/tables in `ThreadLocal`.
-    let env_inner = env.env_inner();
-    let tx_ro = thread_local(env);
-    let tables = thread_local(env);
+
+    // TODO: we need to ensure the tables & tapes are in sync here.
+    let tx_ro = db.fjall.snapshot();
+    let tapes = db.linear_tapes.reader();
+
+    let amount_of_outs = outputs
+        .par_iter()
+        .map(|(&amount, _)| {
+            if amount == 0 {
+                Ok((
+                    amount,
+                    tapes
+                        .fixed_sized_tape_len(&db.rct_outputs)
+                        .expect("Required tape not found"),
+                ))
+            } else {
+                // v1 transactions.
+                match get_num_outputs_with_amount(db, &tx_ro, amount) {
+                    Ok(count) => Ok((amount, count)),
+                    Err(e) => Err(e),
+                }
+            }
+        })
+        .collect::<Result<_, _>>()?;
 
     // The 2nd mapping function.
     // This is pulled out from the below `map()` for readability.
-    let inner_map = |amount, amount_index| -> DbResult<(AmountIndex, OutputOnChain)> {
-        let tx_ro = tx_ro.get_or_try(|| env_inner.tx_ro())?;
-        let tables = get_tables!(env_inner, tx_ro, tables)?.as_ref();
-
+    let inner_map = |amount, amount_index| {
         let id = PreRctOutputId {
             amount,
             amount_index,
         };
 
-        let output_on_chain = id_to_output_on_chain(&id, tables)?;
+        let output_on_chain = match id_to_output_on_chain(db, &id, get_txid, &tx_ro, &tapes) {
+            Ok(output) => output,
+            Err(BlockchainError::NotFound) => return Ok(Either::Right(amount_index)),
+            Err(e) => return Err(e),
+        };
 
-        Ok((amount_index, output_on_chain))
+        Ok(Either::Left((amount_index, output_on_chain)))
     };
 
-    // Collect results using `rayon`.
-    let map = outputs
+    let (map, wanted_outputs) = outputs
         .into_par_iter()
         .map(|(amount, amount_index_set)| {
-            Ok((
-                amount,
-                amount_index_set
-                    .into_par_iter()
-                    .map(|amount_index| inner_map(amount, amount_index))
-                    .collect::<DbResult<HashMap<AmountIndex, OutputOnChain>>>()?,
-            ))
-        })
-        .collect::<DbResult<HashMap<Amount, HashMap<AmountIndex, OutputOnChain>>>>()?;
+            let (left, right) = amount_index_set
+                .into_par_iter()
+                .map(|amount_index| inner_map(amount, amount_index))
+                .collect::<Result<_, _>>()?;
 
-    Ok(BlockchainResponse::Outputs(map))
+            Ok(((amount, left), (amount, right)))
+        })
+        .collect::<DbResult<(IndexMap<_, IndexMap<_, _>>, IndexMap<_, IndexSet<_>>)>>()?;
+
+    let cache = OutputCache::new(map, amount_of_outs, wanted_outputs);
+
+    Ok(BlockchainResponse::Outputs(cache))
+}
+
+/// [`BlockchainReadRequest::OutputsVec`].
+#[inline]
+fn outputs_vec(
+    db: &BlockchainDatabase,
+    outputs: Vec<(Amount, AmountIndex)>,
+    get_txid: bool,
+) -> ResponseResult {
+    let tx_ro = db.fjall.snapshot();
+    let tapes = db.linear_tapes.reader();
+
+    let result = outputs
+        .into_iter()
+        .map(|(amount, amount_index)| {
+            let id = PreRctOutputId {
+                amount,
+                amount_index,
+            };
+            let output = id_to_output_on_chain(db, &id, get_txid, &tx_ro, &tapes)?;
+            Ok((amount, vec![(amount_index, output)]))
+        })
+        .collect::<DbResult<Vec<_>>>()?;
+
+    Ok(BlockchainResponse::OutputsVec(result))
 }
 
 /// [`BlockchainReadRequest::NumberOutputsWithAmount`].
 #[inline]
-fn number_outputs_with_amount(env: &ConcreteEnv, amounts: Vec<Amount>) -> ResponseResult {
-    // Prepare tx/tables in `ThreadLocal`.
-    let env_inner = env.env_inner();
-    let tx_ro = thread_local(env);
-    let tables = thread_local(env);
+fn number_outputs_with_amount(db: &BlockchainDatabase, amounts: Vec<Amount>) -> ResponseResult {
+    let tx_ro = db.fjall.snapshot();
+    let tapes = db.linear_tapes.reader();
 
     // Cache the amount of RCT outputs once.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "INVARIANT: #[cfg] @ lib.rs asserts `usize == u64`"
-    )]
-    let num_rct_outputs = {
-        let tx_ro = env_inner.tx_ro()?;
-        let tables = env_inner.open_tables(&tx_ro)?;
-        tables.rct_outputs().len()? as usize
-    };
+    let num_rct_outputs = u64_to_usize(
+        tapes
+            .fixed_sized_tape_len(&db.rct_outputs)
+            .expect("Required tape not found"),
+    );
 
     // Collect results using `rayon`.
     let map = amounts
         .into_par_iter()
         .map(|amount| {
-            let tx_ro = tx_ro.get_or_try(|| env_inner.tx_ro())?;
-            let tables = get_tables!(env_inner, tx_ro, tables)?.as_ref();
-
             if amount == 0 {
                 // v2 transactions.
                 Ok((amount, num_rct_outputs))
             } else {
                 // v1 transactions.
-                match tables.num_outputs().get(&amount) {
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        reason = "INVARIANT: #[cfg] @ lib.rs asserts `usize == u64`"
-                    )]
-                    Ok(count) => Ok((amount, count as usize)),
-                    // If we get a request for an `amount` that doesn't exist,
-                    // we return `0` instead of an error.
-                    Err(RuntimeError::KeyNotFound) => Ok((amount, 0)),
+                match get_num_outputs_with_amount(db, &tx_ro, amount) {
+                    Ok(count) => Ok((amount, u64_to_usize(count))),
                     Err(e) => Err(e),
                 }
             }
@@ -503,18 +717,8 @@ fn number_outputs_with_amount(env: &ConcreteEnv, amounts: Vec<Amount>) -> Respon
 
 /// [`BlockchainReadRequest::KeyImagesSpent`].
 #[inline]
-fn key_images_spent(env: &ConcreteEnv, key_images: HashSet<KeyImage>) -> ResponseResult {
-    // Prepare tx/tables in `ThreadLocal`.
-    let env_inner = env.env_inner();
-    let tx_ro = thread_local(env);
-    let tables = thread_local(env);
-
-    // Key image check function.
-    let key_image_exists = |key_image| {
-        let tx_ro = tx_ro.get_or_try(|| env_inner.tx_ro())?;
-        let tables = get_tables!(env_inner, tx_ro, tables)?.as_ref();
-        key_image_exists(&key_image, tables.key_images())
-    };
+fn key_images_spent(db: &BlockchainDatabase, key_images: HashSet<KeyImage>) -> ResponseResult {
+    let tx_ro = db.fjall.snapshot();
 
     // FIXME:
     // Create/use `enum cuprate_types::Exist { Does, DoesNot }`
@@ -524,7 +728,7 @@ fn key_images_spent(env: &ConcreteEnv, key_images: HashSet<KeyImage>) -> Respons
     // Collect results using `rayon`.
     match key_images
         .into_par_iter()
-        .map(key_image_exists)
+        .map(|ki| tx_ro.contains_key(&db.key_images, ki))
         // If the result is either:
         // `Ok(true)` => a key image was found, return early
         // `Err` => an error was found, return early
@@ -532,23 +736,42 @@ fn key_images_spent(env: &ConcreteEnv, key_images: HashSet<KeyImage>) -> Respons
         // Else, `Ok(false)` will continue the iterator.
         .find_any(|result| !matches!(result, Ok(false)))
     {
-        None | Some(Ok(false)) => Ok(BlockchainResponse::KeyImagesSpent(false)), // Key image was NOT found.
+        None => Ok(BlockchainResponse::KeyImagesSpent(false)), // Key image was NOT found.
         Some(Ok(true)) => Ok(BlockchainResponse::KeyImagesSpent(true)), // Key image was found.
-        Some(Err(e)) => Err(e), // A database error occurred.
+        Some(Err(e)) => Err(e.into()),                         // A database error occurred.
+        Some(Ok(false)) => unreachable!(),
     }
 }
 
+/// [`BlockchainReadRequest::KeyImagesSpentVec`].
+fn key_images_spent_vec(db: &BlockchainDatabase, key_images: Vec<KeyImage>) -> ResponseResult {
+    let tx_ro = db.fjall.snapshot();
+
+    // Collect results using `rayon`.
+    Ok(BlockchainResponse::KeyImagesSpentVec(
+        key_images
+            .into_par_iter()
+            .map(|ki| tx_ro.contains_key(&db.key_images, ki))
+            .collect::<Result<_, _>>()?,
+    ))
+}
+
 /// [`BlockchainReadRequest::CompactChainHistory`]
-fn compact_chain_history(env: &ConcreteEnv) -> ResponseResult {
-    let env_inner = env.env_inner();
-    let tx_ro = env_inner.tx_ro()?;
+fn compact_chain_history(db: &BlockchainDatabase) -> ResponseResult {
+    let tapes = db.linear_tapes.reader();
 
-    let table_block_heights = env_inner.open_db_ro::<BlockHeights>(&tx_ro)?;
-    let table_block_infos = env_inner.open_db_ro::<BlockInfos>(&tx_ro)?;
+    let get_block_info = |height| -> Result<_, BlockchainError> {
+        tapes
+            .read_entry(&db.block_infos, height)?
+            .ok_or(BlockchainError::NotFound)
+    };
 
-    let top_block_height = top_block_height(&table_block_heights)?;
+    let top_block_height = tapes
+        .fixed_sized_tape_len(&db.block_infos)
+        .expect("Required tape not open")
+        - 1;
 
-    let top_block_info = get_block_info(&top_block_height, &table_block_infos)?;
+    let top_block_info = get_block_info(top_block_height)?;
     let cumulative_difficulty = combine_low_high_bits_to_u128(
         top_block_info.cumulative_difficulty_low,
         top_block_info.cumulative_difficulty_high,
@@ -560,12 +783,12 @@ fn compact_chain_history(env: &ConcreteEnv) -> ResponseResult {
     // rayon is not used here because the amount of block IDs is expected to be small.
     let mut block_ids = (0..)
         .map(compact_history_index_to_height_offset::<INITIAL_BLOCKS>)
-        .map_while(|i| top_block_height.checked_sub(i))
-        .map(|height| Ok(get_block_info(&height, &table_block_infos)?.block_hash))
+        .map_while(|i| top_block_height.checked_sub(usize_to_u64(i)))
+        .map(|height| Ok(get_block_info(height)?.block_hash))
         .collect::<DbResult<Vec<_>>>()?;
 
-    if compact_history_genesis_not_included::<INITIAL_BLOCKS>(top_block_height) {
-        block_ids.push(get_block_info(&0, &table_block_infos)?.block_hash);
+    if compact_history_genesis_not_included::<INITIAL_BLOCKS>(u64_to_usize(top_block_height)) {
+        block_ids.push(get_block_info(0)?.block_hash);
     }
 
     Ok(BlockchainResponse::CompactChainHistory {
@@ -581,19 +804,15 @@ fn compact_chain_history(env: &ConcreteEnv) -> ResponseResult {
 /// the returned result is unspecified and meaningless, as this function
 /// performs a binary search.
 fn next_chain_entry(
-    env: &ConcreteEnv,
+    db: &BlockchainDatabase,
     block_ids: &[BlockHash],
     next_entry_size: usize,
 ) -> ResponseResult {
-    // Single-threaded, no `ThreadLocal` required.
-    let env_inner = env.env_inner();
-    let tx_ro = env_inner.tx_ro()?;
+    let tx_ro = db.fjall.snapshot();
 
-    let tables = env_inner.open_tables(&tx_ro)?;
-    let table_block_heights = tables.block_heights();
-    let table_block_infos = tables.block_infos_iter();
+    let tapes = db.linear_tapes.reader();
 
-    let idx = find_split_point(block_ids, false, table_block_heights)?;
+    let idx = find_split_point(db, block_ids, false, false, &tx_ro)?;
 
     // This will happen if we have a different genesis block.
     if idx == block_ids.len() {
@@ -609,29 +828,37 @@ fn next_chain_entry(
 
     // The returned chain entry must overlap with one of the blocks  we were told about.
     let first_known_block_hash = block_ids[idx];
-    let first_known_height = table_block_heights.get(&first_known_block_hash)?;
+    let first_known_height =
+        block_height(db, &tx_ro, &first_known_block_hash)?.ok_or(BlockchainError::NotFound)?;
 
-    let chain_height = crate::ops::blockchain::chain_height(table_block_heights)?;
+    let chain_height = crate::ops::blockchain::chain_height(db, &tapes)?;
     let last_height_in_chain_entry = min(first_known_height + next_entry_size, chain_height);
 
-    let (block_ids, block_weights) = (first_known_height..last_height_in_chain_entry)
-        .map(|height| {
-            let block_info = table_block_infos.get(&height)?;
+    let entry_count = last_height_in_chain_entry - first_known_height;
+    let mut block_infos = vec![crate::types::BlockInfo::default(); entry_count];
+    tapes.read_entries(
+        &db.block_infos,
+        usize_to_u64(first_known_height),
+        &mut block_infos,
+    )?;
 
-            Ok((block_info.block_hash, block_info.weight))
-        })
-        .collect::<DbResult<(Vec<_>, Vec<_>)>>()?;
+    let (block_ids, block_weights) = block_infos
+        .iter()
+        .map(|info| (info.block_hash, info.weight))
+        .unzip::<_, _, Vec<_>, Vec<_>>();
 
-    let top_block_info = table_block_infos.get(&(chain_height - 1))?;
+    let top_block_info = tapes
+        .read_entry(&db.block_infos, usize_to_u64(chain_height) - 1)?
+        .ok_or(BlockchainError::NotFound)?;
 
     let first_block_blob = if block_ids.len() >= 2 {
-        Some(get_block_blob_with_tx_indexes(&(first_known_height + 1), &tables)?.0)
+        Some(get_block(&(first_known_height + 1), None, &tapes, db)?.serialize())
     } else {
         None
     };
 
     Ok(BlockchainResponse::NextChainEntry {
-        start_height: std::num::NonZero::new(first_known_height),
+        start_height: Some(first_known_height),
         chain_height,
         block_ids,
         block_weights,
@@ -649,69 +876,105 @@ fn next_chain_entry(
 /// `block_ids` must be sorted in chronological block order, or else
 /// the returned result is unspecified and meaningless, as this function
 /// performs a binary search.
-fn find_first_unknown(env: &ConcreteEnv, block_ids: &[BlockHash]) -> ResponseResult {
-    let env_inner = env.env_inner();
-    let tx_ro = env_inner.tx_ro()?;
-
-    let table_block_heights = env_inner.open_db_ro::<BlockHeights>(&tx_ro)?;
-
-    let idx = find_split_point(block_ids, true, &table_block_heights)?;
+fn find_first_unknown(db: &BlockchainDatabase, block_ids: &[BlockHash]) -> ResponseResult {
+    let tx_ro = db.fjall.snapshot();
+    let idx = find_split_point(db, block_ids, true, true, &tx_ro)?;
 
     Ok(if idx == block_ids.len() {
         BlockchainResponse::FindFirstUnknown(None)
     } else if idx == 0 {
         BlockchainResponse::FindFirstUnknown(Some((0, 0)))
     } else {
-        let last_known_height = get_block_height(&block_ids[idx - 1], &table_block_heights)?;
+        let last_known_height = usize::from_le_bytes(
+            tx_ro
+                .get(&db.block_heights, block_ids[idx - 1])?
+                .unwrap()
+                .as_ref()
+                .try_into()
+                .unwrap(),
+        );
 
         BlockchainResponse::FindFirstUnknown(Some((idx, last_known_height + 1)))
     })
 }
 
 /// [`BlockchainReadRequest::TxsInBlock`]
-fn txs_in_block(env: &ConcreteEnv, block_hash: [u8; 32], missing_txs: Vec<u64>) -> ResponseResult {
-    // Single-threaded, no `ThreadLocal` required.
-    let env_inner = env.env_inner();
-    let tx_ro = env_inner.tx_ro()?;
-    let tables = env_inner.open_tables(&tx_ro)?;
+fn txs_in_block(
+    db: &BlockchainDatabase,
+    block_hash: BlockHash,
+    missing_txs: Vec<u64>,
+) -> ResponseResult {
+    let tx_ro = db.fjall.snapshot();
+    let tapes = db.linear_tapes.reader();
 
-    let block_height = tables.block_heights().get(&block_hash)?;
+    // Check the main chain first, fall back to alt blocks if not found.
+    let (block, txs) = if let Some(block_height) = block_height(db, &tx_ro, &block_hash)? {
+        let block_info = tapes
+            .read_entry(&db.block_infos, usize_to_u64(block_height))?
+            .ok_or(BlockchainError::NotFound)?;
 
-    let (block, miner_tx_index, numb_txs) = get_block_blob_with_tx_indexes(&block_height, &tables)?;
-    let first_tx_index = miner_tx_index + 1;
+        let block = get_block(&block_height, Some(&block_info), &tapes, db)?;
+        let first_tx_index = block_info.mining_tx_index + 1;
 
-    if numb_txs < missing_txs.len() {
-        return Ok(BlockchainResponse::TxsInBlock(None));
-    }
+        if block.transactions.len() < missing_txs.len()
+            || missing_txs
+                .iter()
+                .any(|&i| i >= usize_to_u64(block.transactions.len()))
+        {
+            return Ok(BlockchainResponse::TxsInBlock(None));
+        }
 
-    let txs = missing_txs
-        .into_iter()
-        .map(|index_offset| Ok(tables.tx_blobs().get(&(first_tx_index + index_offset))?.0))
-        .collect::<DbResult<_>>()?;
+        let txs = missing_txs
+            .into_iter()
+            .map(|index_offset| get_tx_blob_from_id(&(first_tx_index + index_offset), &tapes, db))
+            .collect::<DbResult<_>>()?;
+
+        (block, txs)
+    } else {
+        let alt_block_height =
+            alt_block_height(db, &tx_ro, &block_hash)?.ok_or(BlockchainError::NotFound)?;
+
+        let block = get_alt_block(db, &alt_block_height, &tx_ro)?;
+
+        if block.transactions.len() < missing_txs.len()
+            || missing_txs
+                .iter()
+                .any(|&i| i >= usize_to_u64(block.transactions.len()))
+        {
+            return Ok(BlockchainResponse::TxsInBlock(None));
+        }
+
+        let txs = missing_txs
+            .into_iter()
+            .map(|index_offset| {
+                let tx_hash = &block.transactions[u64_to_usize(index_offset)];
+
+                tx_ro
+                    .get(&db.alt_transaction_blobs, tx_hash)?
+                    .map(|blob| blob.to_vec())
+                    .ok_or(BlockchainError::NotFound)
+            })
+            .collect::<DbResult<_>>()?;
+
+        (block, txs)
+    };
 
     Ok(BlockchainResponse::TxsInBlock(Some(TxsInBlock {
-        block,
+        block: block.serialize(),
         txs,
     })))
 }
 
 /// [`BlockchainReadRequest::AltBlocksInChain`]
-fn alt_blocks_in_chain(env: &ConcreteEnv, chain_id: ChainId) -> ResponseResult {
-    // Prepare tx/tables in `ThreadLocal`.
-    let env_inner = env.env_inner();
-    let tx_ro = thread_local(env);
-    let tables = thread_local(env);
+fn alt_blocks_in_chain(db: &BlockchainDatabase, chain_id: ChainId) -> ResponseResult {
+    let tx_ro = db.fjall.snapshot();
 
     // Get the history of this alt-chain.
-    let history = {
-        let tx_ro = tx_ro.get_or_try(|| env_inner.tx_ro())?;
-        let tables = get_tables!(env_inner, tx_ro, tables)?.as_ref();
-        get_alt_chain_history_ranges(0..usize::MAX, chain_id, tables.alt_chain_infos())?
-    };
+    let history = { get_alt_chain_history_ranges(db, 0..usize::MAX, chain_id, &tx_ro)? };
 
     // Get all the blocks until we join the main-chain.
     let blocks = history
-        .par_iter()
+        .iter()
         .rev()
         .skip(1)
         .flat_map(|(chain_id, range)| {
@@ -719,16 +982,14 @@ fn alt_blocks_in_chain(env: &ConcreteEnv, chain_id: ChainId) -> ResponseResult {
                 panic!("Should not have main chain blocks here we skipped last range");
             };
 
-            range.clone().into_par_iter().map(|height| {
-                let tx_ro = tx_ro.get_or_try(|| env_inner.tx_ro())?;
-                let tables = get_tables!(env_inner, tx_ro, tables)?.as_ref();
-
-                get_alt_block(
+            range.clone().map(|height| {
+                get_alt_block_information(
+                    db,
                     &AltBlockHeight {
                         chain_id: (*chain_id).into(),
                         height,
                     },
-                    tables,
+                    &tx_ro,
                 )
             })
         })
@@ -738,44 +999,490 @@ fn alt_blocks_in_chain(env: &ConcreteEnv, chain_id: ChainId) -> ResponseResult {
 }
 
 /// [`BlockchainReadRequest::Block`]
-fn block(env: &ConcreteEnv, block_height: BlockHeight) -> ResponseResult {
-    Ok(BlockchainResponse::Block(todo!()))
+fn block(db: &BlockchainDatabase, block_height: BlockHeight) -> ResponseResult {
+    let tapes = db.linear_tapes.reader();
+
+    Ok(BlockchainResponse::Block(get_block(
+        &block_height,
+        None,
+        &tapes,
+        db,
+    )?))
 }
 
 /// [`BlockchainReadRequest::BlockByHash`]
-fn block_by_hash(env: &ConcreteEnv, block_hash: BlockHash) -> ResponseResult {
-    Ok(BlockchainResponse::Block(todo!()))
+fn block_by_hash(db: &BlockchainDatabase, block_hash: BlockHash) -> ResponseResult {
+    let tx_ro = db.fjall.snapshot();
+    let tapes = db.linear_tapes.reader();
+
+    Ok(BlockchainResponse::Block(get_block_by_hash(
+        db,
+        &block_hash,
+        &tx_ro,
+        &tapes,
+    )?))
 }
 
 /// [`BlockchainReadRequest::TotalTxCount`]
-fn total_tx_count(env: &ConcreteEnv) -> ResponseResult {
-    Ok(BlockchainResponse::TotalTxCount(todo!()))
+fn total_tx_count(db: &BlockchainDatabase) -> BlockchainResponse {
+    let tapes = db.linear_tapes.reader();
+    let count = u64_to_usize(
+        tapes
+            .fixed_sized_tape_len(&db.tx_infos)
+            .expect("tx_infos tape exists"),
+    );
+
+    BlockchainResponse::TotalTxCount(count)
+}
+
+/// Walk a directory recursively and sum the sizes of all files.
+fn dir_size(path: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|e| match e.file_type() {
+            Ok(ft) if ft.is_dir() => dir_size(&e.path()),
+            Ok(ft) if ft.is_file() => e.metadata().map_or(0, |m| m.len()),
+            _ => 0,
+        })
+        .sum()
 }
 
 /// [`BlockchainReadRequest::DatabaseSize`]
-fn database_size(env: &ConcreteEnv) -> ResponseResult {
-    Ok(BlockchainResponse::DatabaseSize {
-        database_size: todo!(),
-        free_space: todo!(),
-    })
+fn database_size(db: &BlockchainDatabase) -> BlockchainResponse {
+    // Sum file sizes in both data directories (blob and index).
+    let blob_size = dir_size(&db.config.blob_dir);
+    let index_size = if db.config.index_dir == db.config.blob_dir {
+        0
+    } else {
+        dir_size(&db.config.index_dir)
+    };
+    let database_size = blob_size + index_size;
+
+    // TODO:
+    let free_space = u64::MAX;
+
+    BlockchainResponse::DatabaseSize {
+        database_size,
+        free_space,
+    }
 }
 
 /// [`BlockchainReadRequest::OutputHistogram`]
-fn output_histogram(env: &ConcreteEnv, input: OutputHistogramInput) -> ResponseResult {
-    Ok(BlockchainResponse::OutputHistogram(todo!()))
+fn output_histogram(db: &BlockchainDatabase, input: &OutputHistogramInput) -> ResponseResult {
+    let tapes = db.linear_tapes.reader();
+    let tx_ro = db.fjall.snapshot();
+
+    let num_rct_outputs = tapes
+        .fixed_sized_tape_len(&db.rct_outputs)
+        .expect("rct_outputs tape exists");
+
+    let amounts_and_counts: BTreeMap<Amount, u64> = if input.amounts.is_empty() {
+        let mut result = BTreeMap::new();
+
+        // RCT outputs are represented as amount = 0 and live in a separate tape.
+        if num_rct_outputs > 0 {
+            result.insert(0_u64, num_rct_outputs);
+        }
+
+        // We need to get the amount of outputs for each amount. We do this by first finding the next
+        // `amount` value in the sorted table, then calling `get_num_outputs_with_amount`, then using
+        // fjalls `range` to find the next amount value.
+        let mut next = tx_ro.first_key_value(&db.pre_rct_outputs);
+        while let Some(guard) = next {
+            let amount = Amount::from_be_bytes(guard.key()?[..8].try_into().unwrap());
+
+            result.insert(amount, get_num_outputs_with_amount(db, &tx_ro, amount)?);
+
+            // Seek the first key of the next amount group, stopping on overflow/end.
+            next = match amount.checked_add(1) {
+                Some(next_amount) => tx_ro
+                    .range(&db.pre_rct_outputs, next_amount.to_be_bytes()..)
+                    .next(),
+                None => None,
+            };
+        }
+
+        result
+    } else {
+        // Use the caller-specified amounts.
+        input
+            .amounts
+            .iter()
+            .map(|&amount| {
+                let count = if amount == 0 {
+                    num_rct_outputs
+                } else {
+                    get_num_outputs_with_amount(db, &tx_ro, amount)?
+                };
+                Ok((amount, count))
+            })
+            .collect::<DbResult<_>>()?
+    };
+
+    let current_height = tapes
+        .fixed_sized_tape_len(&db.block_infos)
+        .expect("block_infos tape exists");
+
+    let histogram = amounts_and_counts
+        .into_iter()
+        .filter(|&(_, total_instances)| {
+            // filter the amounts that have to many or too little outputs
+            (input.min_count == 0 || total_instances >= input.min_count)
+                && (input.max_count == 0 || total_instances <= input.max_count)
+        })
+        .map(|(amount, total_instances)| {
+            let (unlocked_instances, recent_instances) =
+                if input.unlocked || input.recent_cutoff > 0 {
+                    unlocked_and_recent_instances(
+                        db,
+                        &tx_ro,
+                        &tapes,
+                        amount,
+                        total_instances,
+                        current_height,
+                        input.recent_cutoff,
+                    )?
+                } else {
+                    (0, 0)
+                };
+
+            Ok(OutputHistogramEntry {
+                amount,
+                total_instances,
+                unlocked_instances,
+                recent_instances,
+            })
+        })
+        .collect::<DbResult<_>>()?;
+
+    Ok(BlockchainResponse::OutputHistogram(histogram))
 }
 
 /// [`BlockchainReadRequest::CoinbaseTxSum`]
-fn coinbase_tx_sum(env: &ConcreteEnv, height: usize, count: u64) -> ResponseResult {
-    Ok(BlockchainResponse::CoinbaseTxSum(todo!()))
+fn coinbase_tx_sum(db: &BlockchainDatabase, height: usize, count: u64) -> ResponseResult {
+    let tapes = db.linear_tapes.reader();
+
+    let start_cumulative = if height == 0 {
+        0_u64
+    } else {
+        tapes
+            .read_entry(&db.block_infos, usize_to_u64(height - 1))?
+            .ok_or(BlockchainError::NotFound)?
+            .cumulative_generated_coins
+    };
+
+    let (emission_amount, fee_amount, _) = (height..)
+        .zip(tapes.iter_from(&db.block_infos, usize_to_u64(height))?)
+        .take(u64_to_usize(count))
+        .try_fold(
+            (0_u128, 0_u128, start_cumulative),
+            |(emission_amount, fee_amount, prev_cumulative), (h, block_info)| {
+                let block_info = block_info?;
+
+                // base_reward = newly minted coins for this block (does not include fees).
+                let base_reward = block_info
+                    .cumulative_generated_coins
+                    .saturating_sub(prev_cumulative);
+
+                // coinbase_output = sum of miner_tx output amounts = base_reward + block_fees.
+                let block = get_block(&h, Some(&block_info), &tapes, db)?;
+                let coinbase_output: u64 = block
+                    .miner_transaction()
+                    .prefix()
+                    .outputs
+                    .iter()
+                    .map(|o| o.amount.unwrap_or(0))
+                    .sum();
+
+                DbResult::Ok((
+                    emission_amount + u128::from(base_reward),
+                    fee_amount + u128::from(coinbase_output.saturating_sub(base_reward)),
+                    block_info.cumulative_generated_coins,
+                ))
+            },
+        )?;
+
+    let (emission_amount, emission_amount_top64) = split_u128_into_low_high_bits(emission_amount);
+    let (fee_amount, fee_amount_top64) = split_u128_into_low_high_bits(fee_amount);
+
+    Ok(BlockchainResponse::CoinbaseTxSum(CoinbaseTxSum {
+        emission_amount,
+        emission_amount_top64,
+        fee_amount,
+        fee_amount_top64,
+    }))
 }
 
 /// [`BlockchainReadRequest::AltChains`]
-fn alt_chains(env: &ConcreteEnv) -> ResponseResult {
-    Ok(BlockchainResponse::AltChains(todo!()))
+fn alt_chains(db: &BlockchainDatabase) -> ResponseResult {
+    let tx_ro = db.fjall.snapshot();
+    let tapes = db.linear_tapes.reader();
+
+    let mut chains = Vec::new();
+
+    for guard in db.alt_chain_infos.iter() {
+        let (chain_id_bytes, chain_info_bytes) = guard.into_inner()?;
+
+        let chain_id = RawChainId(u64::from_le_bytes(
+            chain_id_bytes.as_ref().try_into().unwrap(),
+        ));
+        let chain_info: AltChainInfo = bytemuck::pod_read_unaligned(chain_info_bytes.as_ref());
+
+        let tip = chain_info.chain_height - 1;
+        let history =
+            get_alt_chain_history_ranges(db, 0..chain_info.chain_height, chain_id.into(), &tx_ro)?;
+
+        let tip_height = AltBlockHeight {
+            chain_id,
+            height: tip,
+        };
+        let tip_info_bytes = tx_ro
+            .get(&db.alt_block_infos, bytemuck::bytes_of(&tip_height))?
+            .ok_or(BlockchainError::NotFound)?;
+        let tip_info: CompactAltBlockInfo = bytemuck::pod_read_unaligned(tip_info_bytes.as_ref());
+
+        // The last segment is the main-chain portion. Its range starts at 0 and ends at the
+        // fork height, so the last main chain block = range.end - 1.
+        let main_fork_height = history
+            .last()
+            .map(|(_, r)| r.end.saturating_sub(1))
+            .ok_or(BlockchainError::NotFound)?;
+
+        // Build the hashes of the alt chain all the way to the main chain split point.
+        let mut block_hashes = Vec::new();
+        for (segment_chain, height_range) in &history {
+            let Chain::Alt(segment_chain_id) = segment_chain else {
+                break;
+            };
+            let raw_id = RawChainId::from(*segment_chain_id);
+            for height in height_range.clone().rev() {
+                let alt_h = AltBlockHeight {
+                    chain_id: raw_id,
+                    height,
+                };
+                let info_bytes = tx_ro
+                    .get(&db.alt_block_infos, bytemuck::bytes_of(&alt_h))?
+                    .ok_or(BlockchainError::NotFound)?;
+                let info: CompactAltBlockInfo = bytemuck::pod_read_unaligned(info_bytes.as_ref());
+                block_hashes.push(info.block_hash);
+            }
+        }
+
+        // Get the main chain block hash at the fork point.
+        let main_chain_parent_block = tapes
+            .read_entry(&db.block_infos, usize_to_u64(main_fork_height))?
+            .map(|info| info.block_hash)
+            .ok_or(BlockchainError::NotFound)?;
+
+        let length = usize_to_u64(block_hashes.len());
+
+        chains.push(ChainInfo {
+            block_hash: tip_info.block_hash,
+            block_hashes,
+            difficulty: tip_info.cumulative_difficulty_low,
+            difficulty_top64: tip_info.cumulative_difficulty_high,
+            height: usize_to_u64(tip),
+            length,
+            main_chain_parent_block,
+        });
+    }
+
+    Ok(BlockchainResponse::AltChains(chains))
 }
 
 /// [`BlockchainReadRequest::AltChainCount`]
-fn alt_chain_count(env: &ConcreteEnv) -> ResponseResult {
-    Ok(BlockchainResponse::AltChainCount(todo!()))
+fn alt_chain_count(db: &BlockchainDatabase) -> ResponseResult {
+    let count = db.alt_chain_infos.len()?;
+    Ok(BlockchainResponse::AltChainCount(count))
+}
+
+/// [`BlockchainReadRequest::Transactions`]
+fn transactions(db: &BlockchainDatabase, tx_hashes: Vec<[u8; 32]>) -> ResponseResult {
+    let tx_ro = db.fjall.snapshot();
+    let tapes = db.linear_tapes.reader();
+    let chain_height = crate::ops::blockchain::chain_height(db, &tapes)?;
+
+    let mut txs = Vec::with_capacity(tx_hashes.len());
+    let mut missed_txs = Vec::new();
+    let mut block_timestamps = HashMap::new();
+
+    for tx_hash in tx_hashes {
+        let Some(tx_id) = tx_ro.get(&db.tx_ids, tx_hash)? else {
+            missed_txs.push(tx_hash);
+            continue;
+        };
+
+        let tx_id = u64::from_le_bytes(tx_id.as_ref().try_into().unwrap());
+        let tx_info = tapes
+            .read_entry(&db.tx_infos, tx_id)?
+            .ok_or(BlockchainError::NotFound)?;
+        let block_info = tapes
+            .read_entry(&db.block_infos, usize_to_u64(tx_info.height))?
+            .ok_or(BlockchainError::NotFound)?;
+        let is_miner_tx = tx_id == block_info.mining_tx_index;
+
+        let (pruned_blob, prunable_blob, prunable_hash) =
+            get_split_tx_blobs(&tx_info, is_miner_tx, &tapes, db)?;
+
+        let block_timestamp = if let Some(timestamp) = block_timestamps.get(&tx_info.height) {
+            *timestamp
+        } else {
+            let timestamp =
+                get_block_extended_header_from_height(tx_info.height, &tapes, db)?.timestamp;
+            block_timestamps.insert(tx_info.height, timestamp);
+            timestamp
+        };
+
+        let output_indices = if tx_info.is_v1_tx() {
+            let output_indices = tx_ro
+                .get(&db.v1_tx_outputs, tx_id.to_le_bytes())?
+                .ok_or(BlockchainError::NotFound)?;
+
+            output_indices
+                .chunks(8)
+                .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+                .collect()
+        } else {
+            (0..tx_info.numb_rct_outputs)
+                .map(|i| usize_to_u64(i) + tx_info.rct_output_start_idx)
+                .collect()
+        };
+
+        txs.push(TxInBlockchain {
+            block_height: usize_to_u64(tx_info.height),
+            block_timestamp,
+            confirmations: usize_to_u64(chain_height - tx_info.height),
+            output_indices,
+            tx_hash,
+            pruned_blob,
+            prunable_blob,
+            prunable_hash,
+        });
+    }
+
+    Ok(BlockchainResponse::Transactions { txs, missed_txs })
+}
+
+/// [`BlockchainReadRequest::TotalRctOutputs`]
+fn total_rct_outputs(db: &BlockchainDatabase) -> BlockchainResponse {
+    let tapes = db.linear_tapes.reader();
+
+    let len = tapes
+        .fixed_sized_tape_len(&db.rct_outputs)
+        .expect("Required tape not found");
+
+    BlockchainResponse::TotalRctOutputs(len)
+}
+
+/// [`BlockchainReadRequest::TxOutputIndexes`]
+fn tx_output_indexes(db: &BlockchainDatabase, tx_hash: &[u8; 32]) -> ResponseResult {
+    let tx_ro = db.fjall.snapshot();
+    let tapes = db.linear_tapes.reader();
+
+    let tx_id = tx_ro
+        .get(&db.tx_ids, tx_hash)?
+        .ok_or(BlockchainError::NotFound)?;
+
+    let tx_id = u64::from_le_bytes(tx_id.as_ref().try_into().unwrap());
+
+    let tx_info = tapes
+        .read_entry(&db.tx_infos, tx_id)?
+        .ok_or(BlockchainError::NotFound)?;
+
+    let o_indexes = if tx_info.is_v1_tx() {
+        let bytes = tx_ro
+            .get(&db.v1_tx_outputs, tx_id.to_le_bytes())?
+            .ok_or(BlockchainError::NotFound)?;
+
+        bytemuck::pod_collect_to_vec(bytes.as_ref())
+    } else {
+        (0..tx_info.numb_rct_outputs)
+            .map(|i| usize_to_u64(i) + tx_info.rct_output_start_idx)
+            .collect()
+    };
+
+    Ok(BlockchainResponse::TxOutputIndexes(o_indexes))
+}
+
+/// [`BlockchainReadRequest::PreRctOutputDistribution`]
+fn pre_rct_output_distribution(
+    db: &BlockchainDatabase,
+    input: &PreRctOutputDistributionInput,
+) -> ResponseResult {
+    let tapes = db.linear_tapes.reader();
+    let chain_height = u64_to_usize(
+        tapes
+            .fixed_sized_tape_len(&db.block_infos)
+            .expect("block_infos tape exists"),
+    );
+
+    if input.to_height.is_some_and(|h| h.get() < input.from_height) {
+        return Err(BlockchainError::NotFound);
+    }
+
+    let to_height = input.to_height.map_or(chain_height - 1, |h| {
+        let h = h.get();
+        u64_to_usize(h)
+    });
+
+    if to_height >= chain_height {
+        return Err(BlockchainError::NotFound);
+    }
+
+    let mut result = Vec::with_capacity(input.amounts.len());
+
+    for &amount in &input.amounts {
+        let amount = amount.get();
+
+        let start_height = u64_to_usize(input.from_height);
+
+        if start_height > to_height {
+            return Err(BlockchainError::NotFound);
+        }
+
+        let mut per_block: Vec<u64> = vec![0; to_height - start_height + 1];
+        let mut below_start: u64 = 0;
+
+        // loop over all outputs with this amount.
+        for guard in db.pre_rct_outputs.prefix(amount.to_be_bytes()) {
+            let output: Output = bytemuck::pod_read_unaligned(guard.value()?.as_ref());
+            let h = output.height;
+            // Add the output to the block it says it is in.
+            if h < start_height {
+                below_start += 1;
+            } else if h <= to_height {
+                per_block[h - start_height] += 1;
+            } else {
+                // The outputs are sorted by (amount, height), so we can stop
+                // once we see a height above the range.
+                break;
+            }
+        }
+
+        // monerod folds the below `start_height` count into the first bucket and
+        // reports `base = 0` for pre-RCT amounts.
+        per_block[0] += below_start;
+
+        let distribution = if input.cumulative {
+            let mut cumulative = per_block;
+            for i in 1..cumulative.len() {
+                cumulative[i] += cumulative[i - 1];
+            }
+            cumulative
+        } else {
+            per_block
+        };
+
+        result.push(OutputDistributionData {
+            amount,
+            distribution,
+            start_height: usize_to_u64(start_height),
+            base: 0,
+        });
+    }
+
+    Ok(BlockchainResponse::PreRctOutputDistribution(result))
 }

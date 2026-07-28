@@ -10,22 +10,22 @@ use futures::{
     future::{BoxFuture, Shared},
     FutureExt,
 };
-use monero_serai::{block::Block, transaction::Transaction};
-use tokio::sync::{broadcast, oneshot, watch};
+use monero_oxide::{block::Block, transaction::Transaction};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_stream::wrappers::WatchStream;
 use tower::{Service, ServiceExt};
+use tracing::instrument;
 
 use cuprate_blockchain::service::BlockchainReadHandle;
 use cuprate_consensus::{
     transactions::new_tx_verification_data, BlockChainContextRequest, BlockChainContextResponse,
-    BlockChainContextService,
+    BlockchainContextService,
 };
 use cuprate_dandelion_tower::TxState;
 use cuprate_fixed_bytes::ByteArrayVec;
-use cuprate_helper::cast::u64_to_usize;
 use cuprate_helper::{
     asynch::rayon_spawn_async,
-    cast::usize_to_u64,
+    cast::{u64_to_usize, usize_to_u64},
     map::{combine_low_high_bits_to_u128, split_u128_into_low_high_bits},
 };
 use cuprate_p2p::constants::{
@@ -46,7 +46,7 @@ use cuprate_wire::protocol::{
 };
 
 use crate::{
-    blockchain::interface::{self as blockchain_interface, IncomingBlockError},
+    blockchain::interface::{BlockchainManagerHandle, IncomingBlockError},
     constants::PANIC_CRITICAL_SERVICE_ERROR,
     p2p::CrossNetworkInternalPeerId,
     txpool::{IncomingTxError, IncomingTxHandler, IncomingTxs},
@@ -56,7 +56,7 @@ use crate::{
 #[derive(Clone)]
 pub struct P2pProtocolRequestHandlerMaker {
     pub blockchain_read_handle: BlockchainReadHandle,
-    pub blockchain_context_service: BlockChainContextService,
+    pub blockchain_context_service: BlockchainContextService,
     pub txpool_read_handle: TxpoolReadHandle,
 
     /// The [`IncomingTxHandler`], wrapped in an [`Option`] as there is a cyclic reference between [`P2pProtocolRequestHandlerMaker`]
@@ -65,6 +65,9 @@ pub struct P2pProtocolRequestHandlerMaker {
 
     /// A [`Future`](std::future::Future) that produces the [`IncomingTxHandler`].
     pub incoming_tx_handler_fut: Shared<oneshot::Receiver<IncomingTxHandler>>,
+
+    /// Handle for the blockchain manager.
+    pub blockchain_manager: BlockchainManagerHandle,
 }
 
 impl<A: NetZoneAddress> Service<PeerInformation<A>> for P2pProtocolRequestHandlerMaker
@@ -105,6 +108,7 @@ where
             blockchain_context_service: self.blockchain_context_service.clone(),
             txpool_read_handle,
             incoming_tx_handler,
+            blockchain_manager: self.blockchain_manager.clone(),
         }))
     }
 }
@@ -114,9 +118,10 @@ where
 pub struct P2pProtocolRequestHandler<N: NetZoneAddress> {
     peer_information: PeerInformation<N>,
     blockchain_read_handle: BlockchainReadHandle,
-    blockchain_context_service: BlockChainContextService,
+    blockchain_context_service: BlockchainContextService,
     txpool_read_handle: TxpoolReadHandle,
     incoming_tx_handler: IncomingTxHandler,
+    blockchain_manager: BlockchainManagerHandle,
 }
 
 impl<A: NetZoneAddress> Service<ProtocolRequest> for P2pProtocolRequestHandler<A>
@@ -150,7 +155,9 @@ where
                 self.peer_information.clone(),
                 r,
                 self.blockchain_read_handle.clone(),
+                self.blockchain_context_service.clone(),
                 self.txpool_read_handle.clone(),
+                self.blockchain_manager.clone(),
             )
             .boxed(),
             ProtocolRequest::NewTransactions(r) => new_transactions(
@@ -238,7 +245,7 @@ async fn get_chain(
         split_u128_into_low_high_bits(cumulative_difficulty);
 
     Ok(ProtocolResponse::GetChain(ChainResponse {
-        start_height: usize_to_u64(std::num::NonZero::get(start_height)),
+        start_height: usize_to_u64(start_height),
         total_height: usize_to_u64(chain_height),
         cumulative_difficulty_low64,
         cumulative_difficulty_top64,
@@ -298,9 +305,10 @@ async fn new_fluffy_block<A: NetZoneAddress>(
     peer_information: PeerInformation<A>,
     request: NewFluffyBlock,
     mut blockchain_read_handle: BlockchainReadHandle,
+    mut blockchain_context_service: BlockchainContextService,
     mut txpool_read_handle: TxpoolReadHandle,
+    blockchain_manager: BlockchainManagerHandle,
 ) -> anyhow::Result<ProtocolResponse> {
-    // TODO: check context service here and ignore the block?
     let current_blockchain_height = request.current_blockchain_height;
 
     peer_information
@@ -337,13 +345,24 @@ async fn new_fluffy_block<A: NetZoneAddress>(
     })
     .await?;
 
-    let res = blockchain_interface::handle_incoming_block(
-        block,
-        txs,
-        &mut blockchain_read_handle,
-        &mut txpool_read_handle,
-    )
-    .await;
+    let context = blockchain_context_service.blockchain_context();
+    if block.number() + 10 < context.chain_height {
+        tracing::debug!(
+            our_height = context.chain_height,
+            block_height = block.number(),
+            "fluffy block too old, ignoring."
+        );
+        return Ok(ProtocolResponse::NA);
+    }
+
+    let res = blockchain_manager
+        .handle_incoming_block(
+            block,
+            txs,
+            &mut blockchain_read_handle,
+            &mut txpool_read_handle,
+        )
+        .await;
 
     match res {
         Ok(_) => Ok(ProtocolResponse::NA),
@@ -358,51 +377,53 @@ async fn new_fluffy_block<A: NetZoneAddress>(
             // Block's parent was unknown, could be syncing?
             Ok(ProtocolResponse::NA)
         }
+        Err(IncomingBlockError::ChannelClosed) => {
+            // Manager has exited (likely shutdown); drop silently.
+            Ok(ProtocolResponse::NA)
+        }
         Err(e) => Err(e.into()),
     }
 }
 
 /// [`ProtocolRequest::NewTransactions`]
+#[instrument(level = "debug", skip_all, fields(txs = request.txs.len(), stem = !request.dandelionpp_fluff))]
 async fn new_transactions<A>(
     peer_information: PeerInformation<A>,
     request: NewTransactions,
-    mut blockchain_context_service: BlockChainContextService,
+    mut blockchain_context_service: BlockchainContextService,
     mut incoming_tx_handler: IncomingTxHandler,
 ) -> anyhow::Result<ProtocolResponse>
 where
     A: NetZoneAddress,
     InternalPeerID<A>: Into<CrossNetworkInternalPeerId>,
 {
-    let BlockChainContextResponse::Context(context) = blockchain_context_service
-        .ready()
-        .await
-        .expect(PANIC_CRITICAL_SERVICE_ERROR)
-        .call(BlockChainContextRequest::Context)
-        .await
-        .expect(PANIC_CRITICAL_SERVICE_ERROR)
-    else {
-        unreachable!()
-    };
+    tracing::debug!("handling new transactions");
 
-    let context = context.unchecked_blockchain_context();
+    let context = blockchain_context_service.blockchain_context();
 
     // If we are more than 2 blocks behind the peer then ignore the txs - we are probably still syncing.
-    if usize_to_u64(context.chain_height + 2)
-        < peer_information
-            .core_sync_data
-            .lock()
-            .unwrap()
-            .current_height
-    {
+    let peer_height = peer_information
+        .core_sync_data
+        .lock()
+        .unwrap()
+        .current_height;
+    if usize_to_u64(context.chain_height + 2) < peer_height {
+        tracing::debug!(
+            our_height = context.chain_height,
+            peer_height,
+            "we are too far behind peer, ignoring txs."
+        );
         return Ok(ProtocolResponse::NA);
     }
 
-    let state = if request.dandelionpp_fluff {
+    let addr = peer_information.id.into();
+
+    let anon_zone = matches!(addr, CrossNetworkInternalPeerId::Tor(_));
+
+    let state = if request.dandelionpp_fluff && !anon_zone {
         TxState::Fluff
     } else {
-        TxState::Stem {
-            from: peer_information.id.into(),
-        }
+        TxState::Stem { from: addr }
     };
 
     // Drop all the data except the stuff we still need.
@@ -412,7 +433,12 @@ where
         .ready()
         .await
         .expect(PANIC_CRITICAL_SERVICE_ERROR)
-        .call(IncomingTxs { txs, state })
+        .call(IncomingTxs {
+            txs,
+            state,
+            drop_relay_rule_errors: true,
+            do_not_relay: false,
+        })
         .await;
 
     match res {

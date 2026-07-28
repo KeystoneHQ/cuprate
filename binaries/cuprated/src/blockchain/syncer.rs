@@ -1,80 +1,195 @@
-// FIXME: This whole module is not great and should be rewritten when the PeerSet is made.
-use std::{sync::Arc, time::Duration};
-
-use futures::StreamExt;
-use tokio::{
-    sync::{mpsc, Notify},
-    time::interval,
+use std::{
+    future::Future,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
+
+use futures::{FutureExt, StreamExt};
+use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::CancellationToken;
 use tower::{Service, ServiceExt};
 use tracing::instrument;
 
-use cuprate_consensus::{BlockChainContext, BlockChainContextRequest, BlockChainContextResponse};
+use cuprate_consensus::{BlockChainContextRequest, BlockChainContextResponse, BlockchainContext};
+use cuprate_consensus_context::BlockchainContextService;
+use cuprate_helper::cast::usize_to_u64;
 use cuprate_p2p::{
     block_downloader::{BlockBatch, BlockDownloaderConfig, ChainSvcRequest, ChainSvcResponse},
     NetworkInterface, PeerSetRequest, PeerSetResponse,
 };
-use cuprate_p2p_core::ClearNet;
+use cuprate_p2p_core::{client::PeerSyncCallback, ClearNet, CoreSyncData, NetworkZone};
 
-const CHECK_SYNC_FREQUENCY: Duration = Duration::from_secs(30);
+use super::BlockchainManagerHandle;
 
-/// An error returned from the [`syncer`].
+/// An error returned from the [`BlockchainSyncer`].
 #[derive(Debug, thiserror::Error)]
 pub enum SyncerError {
     #[error("Incoming block channel closed.")]
     IncomingBlockChannelClosed,
     #[error("One of our services returned an error: {0}.")]
     ServiceError(#[from] tower::BoxError),
+    #[error("Sync permit semaphore closed unexpectedly: {0}.")]
+    SemaphoreClosed(#[from] tokio::sync::AcquireError),
 }
 
-/// The syncer tasks that makes sure we are fully synchronised with our connected peers.
-#[instrument(level = "debug", skip_all)]
-pub async fn syncer<C, CN>(
-    mut context_svc: C,
-    our_chain: CN,
-    mut clearnet_interface: NetworkInterface<ClearNet>,
-    incoming_block_batch_tx: mpsc::Sender<BlockBatch>,
-    stop_current_block_downloader: Arc<Notify>,
-    block_downloader_config: BlockDownloaderConfig,
-) -> Result<(), SyncerError>
-where
-    C: Service<
-        BlockChainContextRequest,
-        Response = BlockChainContextResponse,
-        Error = tower::BoxError,
-    >,
-    C::Future: Send + 'static,
-    CN: Service<ChainSvcRequest, Response = ChainSvcResponse, Error = tower::BoxError>
-        + Clone
-        + Send
-        + 'static,
-    CN::Future: Send + 'static,
-{
-    tracing::info!("Starting blockchain syncer");
+#[derive(Debug, PartialEq)]
+enum SyncStatus {
+    NoPeers,
+    BehindPeers,
+    Synced,
+}
 
-    let mut check_sync_interval = interval(CHECK_SYNC_FREQUENCY);
+/// The syncer that makes sure we are fully synchronised with our connected peers.
+pub struct BlockchainSyncer {
+    notify_syncer: Arc<Notify>,
+    synced_tx: Option<futures::channel::oneshot::Sender<()>>,
+    target_height: Arc<AtomicU64>,
+}
 
-    let BlockChainContextResponse::Context(mut blockchain_ctx) = context_svc
-        .ready()
-        .await?
-        .call(BlockChainContextRequest::Context)
-        .await?
-    else {
-        unreachable!();
-    };
+impl BlockchainSyncer {
+    /// Create a new [`BlockchainSyncer`] from its handle and the sender used to signal the node has synced.
+    pub fn new(
+        handle: &BlockchainSyncerHandle,
+        synced_tx: futures::channel::oneshot::Sender<()>,
+        offline: bool,
+    ) -> Self {
+        let synced_tx = if offline {
+            #[expect(clippy::let_underscore_must_use)]
+            let _ = synced_tx.send(());
+            None
+        } else {
+            Some(synced_tx)
+        };
 
-    tracing::debug!("Waiting for new sync info in top sync channel");
+        Self {
+            notify_syncer: Arc::clone(&handle.notify_syncer),
+            synced_tx,
+            target_height: Arc::clone(&handle.target_height),
+        }
+    }
 
-    loop {
-        check_sync_interval.tick().await;
+    /// Run the syncer.
+    #[instrument(name = "syncer", level = "debug", skip_all)]
+    #[expect(clippy::significant_drop_tightening)]
+    #[expect(clippy::too_many_arguments)]
+    pub async fn run<CN>(
+        mut self,
+        mut context_svc: BlockchainContextService,
+        our_chain: CN,
+        mut clearnet_interface: NetworkInterface<ClearNet>,
+        incoming_block_batch_tx: mpsc::Sender<(BlockBatch, Arc<OwnedSemaphorePermit>)>,
+        stop_current_block_downloader: Arc<Notify>,
+        block_downloader_config: BlockDownloaderConfig,
+        shutdown_token: CancellationToken,
+    ) -> Result<(), SyncerError>
+    where
+        CN: Service<
+                ChainSvcRequest<ClearNet>,
+                Response = ChainSvcResponse<ClearNet>,
+                Error = tower::BoxError,
+            > + Clone
+            + Send
+            + 'static,
+        CN::Future: Send + 'static,
+    {
+        tracing::info!("Starting blockchain syncer");
+        tracing::debug!("Waiting for new sync info in top sync channel");
 
-        tracing::trace!("Checking connected peers to see if we are behind",);
+        let semaphore = Arc::new(Semaphore::new(1));
+        let mut sync_permit = Arc::new(Arc::clone(&semaphore).acquire_owned().await?);
 
-        check_update_blockchain_context(&mut context_svc, &mut blockchain_ctx).await?;
-        let raw_blockchain_context = blockchain_ctx.unchecked_blockchain_context();
+        loop {
+            tokio::select! {
+                biased;
+                () = shutdown_token.cancelled() => {
+                    tracing::info!("Blockchain syncer shut down.");
+                    return Ok(());
+                }
+                () = self.notify_syncer.notified() => {}
+            }
 
+            tracing::trace!("Checking connected peers to see if we are behind",);
+
+            match self
+                .check_sync_status(&mut context_svc, &mut clearnet_interface)
+                .await?
+            {
+                SyncStatus::BehindPeers => {}
+                SyncStatus::NoPeers => continue,
+                SyncStatus::Synced => {
+                    if let Some(synced) = self.synced_tx.take() {
+                        tracing::info!("Synchronised with the network.");
+                        #[expect(clippy::let_underscore_must_use)]
+                        let _ = synced.send(());
+                    }
+                    continue;
+                }
+            }
+
+            tracing::debug!(
+                "We are behind peers claimed cumulative difficulty, starting block downloader"
+            );
+            let mut block_batch_stream =
+                clearnet_interface.block_downloader(our_chain.clone(), block_downloader_config);
+
+            loop {
+                tokio::select! {
+                    biased;
+                    () = shutdown_token.cancelled() => {
+                        tracing::info!("Blockchain syncer shut down.");
+                        return Ok(());
+                    }
+                    () = stop_current_block_downloader.notified() => {
+                        tracing::info!("Received stop signal, stopping block downloader");
+
+                        drop(sync_permit);
+                        sync_permit = Arc::new(Arc::clone(&semaphore).acquire_owned().await?);
+
+                        self.notify_syncer.notify_one();
+                        break;
+                    }
+                    batch = block_batch_stream.next() => {
+                        let Some(batch) = batch else {
+                            // Wait for all references to the permit have been dropped (which means all blocks in the queue
+                            // have been handled before checking if we are synced.
+                            drop(sync_permit);
+                            sync_permit = Arc::new(Arc::clone(&semaphore).acquire_owned().await?);
+
+                            if self.check_sync_status(&mut context_svc, &mut clearnet_interface).await? == SyncStatus::Synced {
+                                tracing::info!("Synchronised with the network.");
+                                if let Some(synced) = self.synced_tx.take() {
+                                    #[expect(clippy::let_underscore_must_use)]
+                                    let _ = synced.send(());
+                                }
+                            }
+
+                            break;
+                        };
+
+                        tracing::debug!("Got batch, len: {}", batch.blocks.len());
+                        if incoming_block_batch_tx.send((batch, Arc::clone(&sync_permit))).await.is_err() {
+                            if shutdown_token.is_cancelled() {
+                                return Ok(());
+                            }
+                            return Err(SyncerError::IncomingBlockChannelClosed);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Checks if we are behind the connected peers.
+    async fn check_sync_status(
+        &mut self,
+        context_svc: &mut BlockchainContextService,
+        clearnet_interface: &mut NetworkInterface<ClearNet>,
+    ) -> Result<SyncStatus, tower::BoxError> {
         let PeerSetResponse::MostPoWSeen {
             cumulative_difficulty,
+            height,
             ..
         } = clearnet_interface
             .peer_set()
@@ -86,62 +201,90 @@ where
             unreachable!();
         };
 
-        if cumulative_difficulty <= raw_blockchain_context.cumulative_difficulty {
-            continue;
+        if cumulative_difficulty == 0 {
+            self.target_height.store(0, Ordering::Relaxed);
+            return Ok(SyncStatus::NoPeers);
         }
 
-        tracing::debug!(
-            "We are behind peers claimed cumulative difficulty, starting block downloader"
-        );
-        let mut block_batch_stream =
-            clearnet_interface.block_downloader(our_chain.clone(), block_downloader_config);
-
-        loop {
-            tokio::select! {
-                () = stop_current_block_downloader.notified() => {
-                    tracing::info!("Stopping block downloader");
-                    break;
-                }
-                batch = block_batch_stream.next() => {
-                    let Some(batch) = batch else {
-                        break;
-                    };
-
-                    tracing::debug!("Got batch, len: {}", batch.blocks.len());
-                    if incoming_block_batch_tx.send(batch).await.is_err() {
-                        return Err(SyncerError::IncomingBlockChannelClosed);
-                    }
-                }
-            }
+        if cumulative_difficulty > context_svc.blockchain_context().cumulative_difficulty {
+            self.target_height
+                .store(usize_to_u64(height), Ordering::Relaxed);
+            return Ok(SyncStatus::BehindPeers);
         }
+
+        self.target_height.store(0, Ordering::Relaxed);
+        Ok(SyncStatus::Synced)
     }
 }
 
-/// Checks if we should update the given [`BlockChainContext`] and updates it if needed.
-async fn check_update_blockchain_context<C>(
-    context_svc: C,
-    old_context: &mut BlockChainContext,
-) -> Result<(), tower::BoxError>
-where
-    C: Service<
-        BlockChainContextRequest,
-        Response = BlockChainContextResponse,
-        Error = tower::BoxError,
-    >,
-    C::Future: Send + 'static,
-{
-    if old_context.blockchain_context().is_ok() {
-        return Ok(());
+/// Handle for the `BlockchainSyncer`.
+#[derive(Clone)]
+pub struct BlockchainSyncerHandle {
+    /// The syncer notify channel, used to wake the syncer.
+    notify_syncer: Arc<Notify>,
+    /// The synced notify channel, used to wake the tasks waiting on cuprate to be synced.
+    synced: futures::future::Shared<futures::channel::oneshot::Receiver<()>>,
+    /// The target height we are syncing to, 0 if not syncing.
+    target_height: Arc<AtomicU64>,
+}
+
+impl BlockchainSyncerHandle {
+    /// Create a new handle and the sender used to signal the node has synced.
+    pub(crate) fn new() -> (Self, futures::channel::oneshot::Sender<()>) {
+        let (synced_tx, synced_rx) = futures::channel::oneshot::channel();
+
+        (
+            Self {
+                notify_syncer: Arc::new(Notify::new()),
+                synced: synced_rx.shared(),
+                target_height: Arc::new(AtomicU64::new(0)),
+            },
+            synced_tx,
+        )
     }
 
-    let BlockChainContextResponse::Context(ctx) = context_svc
-        .oneshot(BlockChainContextRequest::Context)
-        .await?
-    else {
-        unreachable!();
-    };
+    /// Returns the target sync height. 0 if not syncing.
+    pub fn target_height(&self) -> u64 {
+        self.target_height.load(Ordering::Relaxed)
+    }
 
-    *old_context = ctx;
+    /// A future that resolves when cuprate has synced with the network.
+    pub fn wait_for_synced(
+        &self,
+    ) -> impl Future<Output = Result<(), futures::channel::oneshot::Canceled>> + 'static {
+        self.synced.clone()
+    }
 
-    Ok(())
+    /// Creates a [`PeerSyncCallback`] that filters and wakes the syncer.
+    pub(crate) fn callback(
+        &self,
+        context_svc: BlockchainContextService,
+        blockchain_manager: BlockchainManagerHandle,
+    ) -> PeerSyncCallback {
+        let sync_handle = self.clone();
+        let disconnect_handle = self.clone();
+
+        let on_sync = move |peer_csd: &CoreSyncData| {
+            let ctx = context_svc.blockchain_context_snapshot();
+
+            // If we are synced and the syncer hasn't yet set the node to synced, wake the syncer.
+            if peer_csd.cumulative_difficulty() == ctx.cumulative_difficulty
+                && sync_handle.synced.peek().is_none()
+            {
+                sync_handle.notify_syncer.notify_one();
+            }
+
+            // If we are behind the peer, and we aren't just one block behind with the blockchain manager handling the block, wake the syncer.
+            if peer_csd.cumulative_difficulty() > ctx.cumulative_difficulty
+                && !(peer_csd.current_height.saturating_sub(1) == ctx.chain_height as u64
+                    && blockchain_manager.is_block_being_handled(&peer_csd.top_id))
+            {
+                sync_handle.notify_syncer.notify_one();
+            }
+        };
+
+        let on_disconnect = move || disconnect_handle.notify_syncer.notify_one();
+
+        PeerSyncCallback::new(on_sync, on_disconnect)
+    }
 }

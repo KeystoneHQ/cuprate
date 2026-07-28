@@ -74,9 +74,16 @@ impl<C: LevinCommand + Debug> Decoder for LevinBucketCodec<C> {
                 LevinBucketState::WaitingForHeader => {
                     if src.len() < HEADER_SIZE {
                         return Ok(None);
-                    };
+                    }
 
                     let head = BucketHead::<C>::from_bytes(src);
+
+                    if head.signature != self.protocol.signature {
+                        #[cfg(feature = "tracing")]
+                        tracing::debug!("Peer sent a levin header with an invalid signature.");
+
+                        return Err(BucketError::InvalidHeaderSignature);
+                    }
 
                     #[cfg(feature = "tracing")]
                     tracing::trace!(
@@ -207,13 +214,13 @@ impl<T: LevinBody> Decoder for LevinMessageCodec<T> {
                         tracing::trace!("Received DUMMY bucket from peer, ignoring.");
                         // We may have another bucket in `src`.
                         continue;
-                    };
+                    }
 
                     if flags.contains(Flags::END_FRAGMENT) {
                         return Err(BucketError::InvalidHeaderFlags(
                             "Flag end fragment received before a start fragment",
                         ));
-                    };
+                    }
 
                     if flags.contains(Flags::START_FRAGMENT) {
                         // monerod does not require a start flag before starting a fragmented message,
@@ -254,7 +261,7 @@ impl<T: LevinBody> Decoder for LevinMessageCodec<T> {
                         tracing::trace!("Received DUMMY bucket from peer, ignoring.");
                         // We may have another bucket in `src`.
                         continue;
-                    };
+                    }
 
                     let max_size = u64_to_usize(if self.bucket_codec.handshake_message_seen {
                         self.bucket_codec.protocol.max_packet_size
